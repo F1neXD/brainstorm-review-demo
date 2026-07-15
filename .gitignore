@@ -1,0 +1,14 @@
+node_modules
+dist
+.env
+.env.*
+!.env.example
+data/uploads
+data/outputs
+data/snapshots
+data/store.json
+data/store.json.*
+.tmp-verification
+*.log
+.server.pid
+.client.pid
