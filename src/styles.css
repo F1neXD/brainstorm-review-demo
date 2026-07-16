@@ -5103,6 +5103,61 @@ select:focus-visible {
   box-shadow: var(--shadow);
 }
 
+.version-maintenance {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.version-maintenance > div {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 36px minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.version-maintenance > div > span {
+  width: 36px;
+  height: 36px;
+  display: grid;
+  place-items: center;
+  border-radius: 7px;
+  color: #6a7584;
+  background: var(--surface-muted);
+}
+
+.version-maintenance > div > span.healthy {
+  color: var(--green);
+  background: var(--green-soft);
+}
+
+.version-maintenance > div > div {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.version-maintenance strong,
+.version-maintenance small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.version-maintenance strong {
+  font-size: 11px;
+}
+
+.version-maintenance small {
+  color: var(--muted);
+  font-size: 9px;
+}
+
 .version-package-plan > summary {
   min-width: 0;
   min-height: 62px;
@@ -5396,6 +5451,10 @@ select:focus-visible {
 }
 
 @media (max-width: 760px) {
+  .version-maintenance {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
   .package-plan-columns {
     grid-template-columns: minmax(0, 1fr);
   }

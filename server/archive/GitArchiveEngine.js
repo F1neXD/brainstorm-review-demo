@@ -62,6 +62,30 @@ async function removeEmptyDirectories(rootPath, relativePath = "") {
   if (!remaining.length) await fs.rmdir(currentPath);
 }
 
+async function managedEntries(rootPath) {
+  try {
+    return (await fs.readdir(rootPath, { withFileTypes: true }))
+      .filter((entry) => entry.isDirectory() || entry.isFile())
+      .map((entry) => ({ name: entry.name, path: path.join(rootPath, entry.name), type: entry.isDirectory() ? "directory" : "file" }));
+  } catch (error) {
+    if (error.code === "ENOENT") return [];
+    throw error;
+  }
+}
+
+async function entrySize(targetPath) {
+  const stat = await fs.stat(targetPath);
+  if (stat.isFile()) return stat.size;
+  if (!stat.isDirectory()) return 0;
+  const entries = await fs.readdir(targetPath, { withFileTypes: true });
+  let size = 0;
+  for (const entry of entries) {
+    if (entry.isSymbolicLink()) continue;
+    size += await entrySize(path.join(targetPath, entry.name));
+  }
+  return size;
+}
+
 export class GitArchiveEngine extends ArchiveEngine {
   constructor({ archiveRoot, gitBinary = "git", ignoredNames = [] }) {
     super({ archiveRoot: path.resolve(archiveRoot) });
@@ -319,6 +343,72 @@ export class GitArchiveEngine extends ArchiveEngine {
     await this.removeManagedWorktree(restorePath);
     await this.runGit(["worktree", "add", "--detach", restorePath, String(revision)]);
     return { id, revision: String(revision), path: restorePath };
+  }
+
+  async verifyIntegrity({ revisions = [], references = [] } = {}) {
+    await this.initialize();
+    const fsck = await this.runGit(["fsck", "--full", "--no-dangling"]);
+    const revisionResults = [];
+    for (const revision of [...new Set(revisions.filter(Boolean).map(String))]) {
+      const result = await this.runGit(["cat-file", "-e", revision + "^{commit}"], { allowExitCodes: [1, 128] });
+      revisionResults.push({ revision, valid: result.exitCode === 0 });
+    }
+    const referenceResults = [];
+    for (const reference of references) {
+      const result = await this.runGit(["rev-parse", "--verify", String(reference.ref || "")], { allowExitCodes: [1, 128] });
+      const resolvedRevision = result.exitCode === 0 ? String(result.stdout || "").trim() : "";
+      referenceResults.push({
+        ref: String(reference.ref || ""),
+        expectedRevision: String(reference.revision || ""),
+        resolvedRevision,
+        valid: result.exitCode === 0 && (!reference.revision || resolvedRevision === String(reference.revision))
+      });
+    }
+    return {
+      ok: revisionResults.every((entry) => entry.valid) && referenceResults.every((entry) => entry.valid),
+      fsck: String(fsck.stdout || fsck.stderr || "").trim(),
+      revisions: revisionResults,
+      references: referenceResults
+    };
+  }
+
+  async previewGarbageCollection({ referencedCandidateIds = [] } = {}) {
+    await this.initialize();
+    const referenced = new Set(referencedCandidateIds.filter(Boolean).map(String));
+    const refsResult = await this.runGit(["for-each-ref", "--format=%(refname)", "refs/archive/candidates"]);
+    const candidateRefs = String(refsResult.stdout || "").split(/\r?\n/).filter(Boolean).map((ref) => ({
+      ref,
+      candidateId: ref.slice("refs/archive/candidates/".length)
+    }));
+    const staleCandidateRefs = candidateRefs.filter((entry) => !referenced.has(entry.candidateId));
+    const candidateDirectories = await managedEntries(this.candidateRoot);
+    const restoreDirectories = await managedEntries(this.restoreRoot);
+    const patchFiles = await managedEntries(this.patchRoot);
+    const candidatesById = new Set(candidateRefs.map((entry) => entry.candidateId));
+    const orphanCandidateDirectories = candidateDirectories.filter((entry) => !candidatesById.has(entry.name));
+    const disposableEntries = [...orphanCandidateDirectories, ...restoreDirectories, ...patchFiles];
+    const sizedEntries = [];
+    for (const entry of disposableEntries) sizedEntries.push({ ...entry, size: await entrySize(entry.path) });
+    const objectStatsResult = await this.runGit(["count-objects", "-v"]);
+    const objectStats = Object.fromEntries(String(objectStatsResult.stdout || "")
+      .split(/\r?\n/)
+      .filter((line) => line.includes(":"))
+      .map((line) => {
+        const [key, value] = line.split(":");
+        return [key.trim(), Number(value.trim()) || 0];
+      }));
+    return {
+      generatedAt: new Date().toISOString(),
+      referencedCandidateCount: referenced.size,
+      candidateRefCount: candidateRefs.length,
+      staleCandidateRefs,
+      orphanCandidateDirectories: sizedEntries.filter((entry) => orphanCandidateDirectories.some((candidate) => candidate.path === entry.path)),
+      restoreCopies: sizedEntries.filter((entry) => restoreDirectories.some((candidate) => candidate.path === entry.path)),
+      patchFiles: sizedEntries.filter((entry) => patchFiles.some((candidate) => candidate.path === entry.path)),
+      estimatedDisposableBytes: sizedEntries.reduce((sum, entry) => sum + entry.size, 0),
+      objectStats,
+      destructiveActionAvailable: false
+    };
   }
 
   async readFile({ revision, filePath, binary = false }) {

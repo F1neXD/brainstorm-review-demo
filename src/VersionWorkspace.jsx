@@ -55,7 +55,9 @@ const operationLabels = {
   inspect: "正在建立口径索引",
   verify: "正在核对会议结论",
   publish: "正在执行发布检查",
-  "initial-release": "正在建立首次正式版"
+  "initial-release": "正在建立首次正式版",
+  integrity: "正在校验归档对象",
+  storage: "正在统计可清理内容"
 };
 
 function formatDate(value) {
@@ -132,6 +134,8 @@ export default function VersionWorkspace({
   const [initialPreview, setInitialPreview] = useState(null);
   const [releaseReview, setReleaseReview] = useState(null);
   const [trace, setTrace] = useState(null);
+  const [integrity, setIntegrity] = useState(null);
+  const [garbagePreview, setGarbagePreview] = useState(null);
   const [busy, setBusy] = useState("");
   const [initialLoading, setInitialLoading] = useState(true);
   const [checkpointLabel, setCheckpointLabel] = useState("");
@@ -504,6 +508,16 @@ export default function VersionWorkspace({
     }
   }
 
+  async function checkIntegrity() {
+    const result = await perform("integrity", () => request("/api/versioning/integrity"), "归档检查完成");
+    if (result?.integrity) setIntegrity(result.integrity);
+  }
+
+  async function previewStorage() {
+    const result = await perform("storage", () => request("/api/versioning/gc-preview"), "存储预览已更新");
+    if (result?.preview) setGarbagePreview(result.preview);
+  }
+
   if (initialLoading) {
     return (
       <div className="version-loading" aria-label="正在加载版本工作区">
@@ -665,6 +679,19 @@ export default function VersionWorkspace({
                 </div>
               ))}
               {!checkpoints.length && <span className="version-muted">暂无检查点</span>}
+            </div>
+          </section>
+
+          <section className="version-maintenance">
+            <div>
+              <span className={integrity?.ok ? "healthy" : ""}><ShieldCheck size={18} /></span>
+              <div><strong>{integrity ? (integrity.ok ? "归档完整" : "发现异常") : "归档检查"}</strong><small>{integrity ? `${integrity.counts.revisions} 个修订 · ${integrity.counts.references} 个引用` : "尚未检查"}</small></div>
+              <button className="quiet-action" onClick={checkIntegrity} disabled={Boolean(busy)}><SpinnerLabel active={busy === "integrity"} icon={FileCheck2}>检查</SpinnerLabel></button>
+            </div>
+            <div>
+              <span><ArchiveRestore size={18} /></span>
+              <div><strong>存储预览</strong><small>{garbagePreview ? `${garbagePreview.staleCandidateRefs.length} 个旧候选 · ${garbagePreview.restoreCopies.length} 个恢复副本` : "尚未统计"}</small></div>
+              <button className="quiet-action" onClick={previewStorage} disabled={Boolean(busy)}><SpinnerLabel active={busy === "storage"} icon={RefreshCw}>预览</SpinnerLabel></button>
             </div>
           </section>
         </div>

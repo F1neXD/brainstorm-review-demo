@@ -2074,6 +2074,22 @@ app.get("/api/versioning/status", async (_req, res) => {
   }
 });
 
+app.get("/api/versioning/integrity", async (_req, res) => {
+  try {
+    res.json({ integrity: await versionWorkspace.verifyArchiveIntegrity() });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/versioning/gc-preview", async (_req, res) => {
+  try {
+    res.json({ preview: await versionWorkspace.previewGarbageCollection() });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.get("/api/versioning/checkpoints", async (_req, res) => {
   try {
     res.json({ checkpoints: await versionWorkspace.listCheckpoints() });

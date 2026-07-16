@@ -379,6 +379,7 @@ export class VersionWorkspaceService {
         fileCount: canonicalHead.fileCount,
         publishedAt: canonicalHead.publishedAt
       } : null,
+      operation: this.operationCoordinator?.status() || { active: null, waiting: 0 },
       capabilities: this.archive?.capabilities || {}
     };
   }
@@ -484,6 +485,65 @@ export class VersionWorkspaceService {
   async listReleases() {
     const store = await this.readStore();
     return [...store.canonReleases].sort((left, right) => Number(right.versionNumber) - Number(left.versionNumber));
+  }
+
+  async verifyArchiveIntegrity() {
+    if (!this.archive?.engine) throw new Error("版本归档当前不可用。");
+    const store = await this.readStore();
+    const candidates = store.changeSets.flatMap((changeSet) => [changeSet.candidate, ...(changeSet.candidateHistory || [])]).filter(Boolean);
+    const revisions = [
+      ...store.documentRevisions.filter((entry) => entry.objectLocator?.type === "git").map((entry) => entry.objectLocator.revision),
+      ...store.checkpoints.map((entry) => entry.archiveRevision),
+      ...store.canonReleases.map((entry) => entry.archiveRevision),
+      ...candidates.map((entry) => entry.archiveRevision)
+    ].filter(Boolean);
+    const references = [
+      ...store.canonReleases.map((entry) => ({ ref: entry.archiveRef, revision: entry.archiveRevision })),
+      ...candidates.map((entry) => ({ ref: entry.archiveRef, revision: entry.archiveRevision }))
+    ].filter((entry) => entry.ref);
+    const archive = await this.archive.engine.verifyIntegrity({ revisions, references });
+    const releaseManifests = [];
+    for (const release of store.canonReleases) {
+      const actual = await this.archive.engine.manifestAtRevision(release.archiveRevision);
+      const actualByPath = new Map(actual.map((entry) => [normalizedPath(entry.sourcePath), entry]));
+      const expectedByPath = new Map((release.manifest || []).map((entry) => [normalizedPath(entry.sourcePath), entry]));
+      const missing = [...expectedByPath.keys()].filter((entry) => !actualByPath.has(entry));
+      const unexpected = [...actualByPath.keys()].filter((entry) => !expectedByPath.has(entry));
+      const hashMismatches = [...expectedByPath.entries()]
+        .filter(([sourcePath, expected]) => actualByPath.has(sourcePath) && actualByPath.get(sourcePath).contentHash !== expected.contentHash)
+        .map(([sourcePath]) => sourcePath);
+      releaseManifests.push({
+        releaseId: release.id,
+        versionNumber: release.versionNumber,
+        valid: !missing.length && !unexpected.length && !hashMismatches.length,
+        missing,
+        unexpected,
+        hashMismatches
+      });
+    }
+    return {
+      checkedAt: this.clock(),
+      ok: archive.ok && releaseManifests.every((entry) => entry.valid),
+      archive,
+      releaseManifests,
+      counts: {
+        revisions: new Set(revisions).size,
+        references: references.length,
+        releases: releaseManifests.length
+      }
+    };
+  }
+
+  async previewGarbageCollection() {
+    if (!this.archive?.engine) throw new Error("版本归档当前不可用。");
+    const store = await this.readStore();
+    const candidateIds = new Set();
+    for (const changeSet of store.changeSets) {
+      if (changeSet.candidate?.id) candidateIds.add(changeSet.candidate.id);
+      for (const candidate of changeSet.candidateHistory || []) if (candidate?.id) candidateIds.add(candidate.id);
+    }
+    for (const release of store.canonReleases) if (release.candidateId) candidateIds.add(release.candidateId);
+    return this.archive.engine.previewGarbageCollection({ referencedCandidateIds: [...candidateIds] });
   }
 
   async compareArchiveRevisions(options) {

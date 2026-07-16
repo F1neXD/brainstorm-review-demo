@@ -37,4 +37,12 @@ export class ArchiveEngine {
   async restore(_options) {
     throw new Error("restore() 尚未实现。");
   }
+
+  async verifyIntegrity(_options) {
+    throw new Error("verifyIntegrity() 尚未实现。");
+  }
+
+  async previewGarbageCollection(_options) {
+    throw new Error("previewGarbageCollection() 尚未实现。");
+  }
 }

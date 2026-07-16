@@ -14,7 +14,9 @@ export async function createArchiveEngine(options) {
         compare: true,
         partialCandidate: true,
         publish: true,
-        restore: true
+        restore: true,
+        integrityCheck: true,
+        garbageCollectionPreview: true
       }
     };
   } catch (error) {
@@ -29,7 +31,9 @@ export async function createArchiveEngine(options) {
         compare: true,
         partialCandidate: false,
         publish: false,
-        restore: false
+        restore: false,
+        integrityCheck: false,
+        garbageCollectionPreview: false
       }
     };
   }
