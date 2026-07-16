@@ -483,6 +483,11 @@ export class VersionWorkspaceService {
     return [...store.canonReleases].sort((left, right) => Number(right.versionNumber) - Number(left.versionNumber));
   }
 
+  async compareArchiveRevisions(options) {
+    if (!this.archive?.engine) throw new Error("版本归档当前不可用。");
+    return this.archive.engine.compare(options);
+  }
+
   async setDocumentVersionState(documentId, versionState) {
     if (!["工作草稿", "历史版本", "待归类"].includes(versionState)) {
       throw new Error("当前正式状态只能通过正式发布产生。");

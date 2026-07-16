@@ -7,6 +7,7 @@ import path from "node:path";
 import multer from "multer";
 import { fileURLToPath } from "node:url";
 import { atomicWriteJson, persistStoreMigration } from "./store/persistence.js";
+import { ChangeSetService } from "./versioning/ChangeSetService.js";
 import { migrateStoreToV4 } from "./versioning/schema.js";
 import { VersionWorkspaceService } from "./versioning/VersionWorkspaceService.js";
 
@@ -1680,6 +1681,67 @@ function toMarkdown(session, items, changePackage) {
   return lines.join("\n");
 }
 
+async function groupWorkspaceChangesWithModel({ changeSet, units, store, sessionId }) {
+  if (!modelConfiguration().apiKey) throw new Error("大模型未配置，原始差异仍可继续审阅。");
+  const queryText = units.map((unit) => [unit.summary, unit.beforeText, unit.afterText].join(" ")).join(" ").slice(0, 8_000);
+  const allChunks = await loadKnowledgeChunks(store, { includeDrafts: true });
+  const frequency = buildDocumentFrequency(allChunks);
+  const semanticCandidates = rankChunksForPoint({
+    normalizedPoint: queryText,
+    originalText: queryText,
+    systems: []
+  }, allChunks, frequency, 12);
+  const meetingItems = sessionId ? store.reviewItems.filter((entry) => entry.sessionId === sessionId) : [];
+  const legacyEvidencePaths = uniqueStrings(meetingItems.flatMap((item) => [
+    ...(item.matchedKnowledge || []).map((entry) => entry.sourcePath || entry.source),
+    ...(item.impactSources || []).map((entry) => entry.sourcePath || entry.source)
+  ]));
+  const canonicalRelease = store.canonReleases.find((entry) => entry.id === changeSet.baselineReleaseId);
+  const canonicalPaths = uniqueStrings((canonicalRelease?.manifest || []).map((entry) => entry.sourcePath));
+  const prompt = `
+你是策划版本变更审阅助手。只把给定差异块按业务语义分组，不得改写补丁，不得虚构 unitId。
+
+返回 JSON：
+{
+  "groups": [
+    {"title":"语义变更标题","summary":"变化说明","impact":"可能影响","confidence":0.0,"unitIds":["changeunit_x"]}
+  ]
+}
+
+差异块：
+${JSON.stringify(units.map((unit) => ({
+  unitId: unit.id,
+  type: unit.fileChangeType,
+  path: unit.afterPath || unit.beforePath,
+  before: String(unit.beforeText || "").slice(0, 800),
+  after: String(unit.afterText || "").slice(0, 800),
+  summary: unit.summary
+})))}
+
+旧会议证据路径：${JSON.stringify(legacyEvidencePaths)}
+当前正式清单路径：${JSON.stringify(canonicalPaths)}
+全库关键词召回：${JSON.stringify(semanticCandidates.map((entry) => ({
+  sourcePath: entry.sourcePath,
+  heading: entry.heading,
+  excerpt: String(entry.content || "").slice(0, 500),
+  authority: entry.authority
+})))}
+`;
+  const result = await callModelJson(prompt);
+  return {
+    groups: Array.isArray(result?.groups) ? result.groups : [],
+    audit: {
+      actualDiffUnitIds: units.map((entry) => entry.id),
+      legacyEvidencePaths,
+      canonicalPaths,
+      semanticCandidatePaths: uniqueStrings(semanticCandidates.map((entry) => entry.sourcePath)),
+      scannedKnowledgeChunks: allChunks.length,
+      modelCandidateChunks: semanticCandidates.length,
+      ignoredDocuments: store.documents.filter((entry) => entry.knowledgeStatus === "忽略").map((entry) => entry.id)
+    }
+  };
+}
+
 const versionWorkspace = new VersionWorkspaceService({
   archiveRoot: versionArchiveRoot,
   legacySnapshotObjectRoot: snapshotObjectDir,
@@ -1690,6 +1752,14 @@ const versionWorkspace = new VersionWorkspaceService({
   },
   makeId,
   clock: now
+});
+
+const changeSetService = new ChangeSetService({
+  readStore,
+  writeStore,
+  versionWorkspace,
+  clock: now,
+  semanticGrouper: groupWorkspaceChangesWithModel
 });
 
 app.get("/api/settings", async (_req, res) => {
@@ -1909,6 +1979,59 @@ app.patch("/api/versioning/documents/:id/state", async (req, res) => {
   try {
     const document = await versionWorkspace.setDocumentVersionState(req.params.id, String(req.body?.versionState || ""));
     res.json({ document });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.get("/api/versioning/change-sets", async (_req, res) => {
+  try {
+    res.json({ changeSets: await changeSetService.listChangeSets() });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/versioning/change-sets/scan", async (req, res) => {
+  try {
+    const changeSet = await changeSetService.createWorkspaceChangeSet({
+      targetCheckpointId: String(req.body?.targetCheckpointId || ""),
+      force: Boolean(req.body?.force)
+    });
+    res.json({ changeSet });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.get("/api/versioning/change-sets/:id", async (req, res) => {
+  try {
+    const changeSet = await changeSetService.getChangeSet(req.params.id);
+    if (!changeSet) return res.status(404).json({ error: "变更集不存在。" });
+    res.json({ changeSet });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/versioning/change-sets/:id/semantic-group", async (req, res) => {
+  try {
+    const changeSet = await changeSetService.groupSemantically(req.params.id, {
+      sessionId: String(req.body?.sessionId || "")
+    });
+    res.json({ changeSet });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.patch("/api/versioning/change-units/:id/assignment", async (req, res) => {
+  try {
+    res.json(await changeSetService.assignUnit(req.params.id, {
+      reviewItemId: String(req.body?.reviewItemId || ""),
+      unrelated: Boolean(req.body?.unrelated),
+      note: String(req.body?.note || "")
+    }));
   } catch (error) {
     res.status(400).json({ error: error.message });
   }

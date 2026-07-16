@@ -303,6 +303,7 @@ export function validateStoreV4(store) {
   const revisionIds = new Set(store.documentRevisions.map((entry) => entry.id));
   const revisionById = new Map(store.documentRevisions.map((entry) => [entry.id, entry]));
   const checkpointIds = new Set(store.checkpoints.map((entry) => entry.id));
+  const changeSetIds = new Set(store.changeSets.map((entry) => entry.id));
   const releaseIds = new Set(store.canonReleases.map((entry) => entry.id));
   for (const document of store.documents) {
     if (!familyIds.has(document.documentFamilyId)) throw new Error("文档引用了不存在的文档族：" + document.id);
@@ -331,6 +332,15 @@ export function validateStoreV4(store) {
     if (changeSet.baselineCheckpointId && !checkpointIds.has(changeSet.baselineCheckpointId)) {
       throw new Error("变更集引用了不存在的基线检查点：" + changeSet.id);
     }
+    if (changeSet.targetCheckpointId && !checkpointIds.has(changeSet.targetCheckpointId)) {
+      throw new Error("变更集引用了不存在的目标检查点：" + changeSet.id);
+    }
+  }
+  for (const unit of store.changeUnits) {
+    if (!changeSetIds.has(unit.changeSetId)) throw new Error("变更单元引用了不存在的变更集：" + unit.id);
+    if (unit.familyId && !familyIds.has(unit.familyId)) throw new Error("变更单元引用了不存在的文档族：" + unit.id);
+    if (unit.beforeRevisionId && !revisionIds.has(unit.beforeRevisionId)) throw new Error("变更单元的修改前修订无效：" + unit.id);
+    if (unit.afterRevisionId && !revisionIds.has(unit.afterRevisionId)) throw new Error("变更单元的修改后修订无效：" + unit.id);
   }
   if (store.versioning?.canonicalHeadId && !releaseIds.has(store.versioning.canonicalHeadId)) {
     throw new Error("canonicalHeadId 引用了不存在的正式版本。");
