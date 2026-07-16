@@ -6,6 +6,7 @@ dist
 data/uploads
 data/outputs
 data/snapshots
+data/version-archive
 data/store.json
 data/store.json.*
 .tmp-verification

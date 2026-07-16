@@ -21,6 +21,12 @@ npm install
 npm run dev
 ```
 
+自动化验证：
+
+```powershell
+npm test
+```
+
 前端默认地址：`http://127.0.0.1:5173`
 接口默认地址：`http://127.0.0.1:8787`
 
