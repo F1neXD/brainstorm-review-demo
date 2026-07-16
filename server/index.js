@@ -433,6 +433,10 @@ async function scanKnowledgeFolder(folderPath, store) {
       knowledgeStatus: existing?.knowledgeStatus || inferKnowledgeStatus({ fileName: file.relativePath }),
       knowledgeStatusManual: Boolean(existing?.knowledgeStatusManual),
       versionLabel: existing?.versionLabel || "",
+      documentFamilyId: existing?.documentFamilyId || "",
+      versionState: existing?.versionState || "工作草稿",
+      versionStateManual: Boolean(existing?.versionStateManual),
+      currentRevisionId: existing?.currentRevisionId || "",
       size: file.size,
       uploadedAt: existing?.uploadedAt || now(),
       updatedAt: file.updatedAt

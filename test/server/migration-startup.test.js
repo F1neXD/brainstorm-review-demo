@@ -5,11 +5,23 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-function legacyStore() {
+function legacyStore(workspacePath) {
   return {
     schemaVersion: 3,
-    knowledgeFolder: "",
-    documents: [],
+    knowledgeFolder: workspacePath,
+    documents: [{
+      id: "doc_1",
+      sourceType: "folder",
+      filePath: path.join(workspacePath, "规则.md"),
+      fileName: "规则.md",
+      originalName: "规则.md",
+      title: "规则",
+      knowledgeStatus: "核心",
+      knowledgeStatusManual: true,
+      tags: [],
+      uploadedAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z"
+    }],
     sessions: [{
       id: "session_1",
       title: "测试会议",
@@ -55,7 +67,10 @@ function waitForServer(child) {
 
 test("完整服务启动时安全迁移 v3，旧读取 API 保持可用", async (context) => {
   const dataDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "brainstorm-server-migration-"));
-  await fs.writeFile(path.join(dataDirectory, "store.json"), JSON.stringify(legacyStore(), null, 2) + "\n", "utf8");
+  const workspacePath = path.join(dataDirectory, "workspace");
+  await fs.mkdir(workspacePath, { recursive: true });
+  await fs.writeFile(path.join(workspacePath, "规则.md"), "测试规则\n", "utf8");
+  await fs.writeFile(path.join(dataDirectory, "store.json"), JSON.stringify(legacyStore(workspacePath), null, 2) + "\n", "utf8");
   const child = spawn(process.execPath, ["server/index.js"], {
     cwd: path.resolve("."),
     env: { ...process.env, BRAINSTORM_DATA_DIR: dataDirectory, PORT: "0" },
@@ -83,6 +98,9 @@ test("完整服务启动时安全迁移 v3，旧读取 API 保持可用", async 
 
   const migrated = JSON.parse(await fs.readFile(path.join(dataDirectory, "store.json"), "utf8"));
   assert.equal(migrated.schemaVersion, 4);
+  assert.equal(migrated.documents.length, 1);
+  assert.equal(migrated.documentFamilies.length, 1);
+  assert.equal(migrated.checkpoints.at(-1).files[0].familyId, migrated.documents[0].documentFamilyId);
   assert.equal(migrated.sessions.length, 1);
   assert.equal(migrated.changePackages.length, 1);
   assert.equal(migrated.changeSets.length, 1);
