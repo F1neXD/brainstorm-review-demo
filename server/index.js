@@ -6,6 +6,8 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import multer from "multer";
 import { fileURLToPath } from "node:url";
+import { atomicWriteJson, persistStoreMigration } from "./store/persistence.js";
+import { migrateStoreToV4 } from "./versioning/schema.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -18,6 +20,7 @@ const outputDir = path.join(dataDir, "outputs");
 const snapshotDir = path.join(dataDir, "snapshots");
 const snapshotObjectDir = path.join(snapshotDir, "objects");
 const storePath = path.join(dataDir, "store.json");
+const migrationsDirectory = path.join(dataDir, "migrations");
 const envPath = path.join(rootDir, ".env");
 
 await fs.mkdir(uploadDir, { recursive: true });
@@ -77,14 +80,30 @@ function clampNumber(value, min, max) {
 
 function defaultStore() {
   return {
-    schemaVersion: 3,
+    schemaVersion: 4,
     documents: [],
     sessions: [],
     reviewItems: [],
     tasks: [],
     changePackages: [],
     knowledgeSnapshots: [],
-    knowledgeFolder: ""
+    knowledgeFolder: "",
+    documentFamilies: [],
+    documentRevisions: [],
+    checkpoints: [],
+    changeSets: [],
+    changeUnits: [],
+    canonReleases: [],
+    adoptionDecisions: [],
+    schemaMigrations: [],
+    versioning: {
+      archiveMode: "uninitialized",
+      archiveStatus: "未初始化",
+      lastCheckpointId: "",
+      canonicalHeadId: "",
+      watcherEnabled: false,
+      lastScanAt: ""
+    }
   };
 }
 
@@ -120,7 +139,8 @@ function inferKnowledgeStatus(document) {
 }
 
 function normalizeStore(rawStore) {
-  const store = { ...defaultStore(), ...(rawStore || {}) };
+  const migrated = migrateStoreToV4(rawStore || defaultStore()).store;
+  const store = { ...defaultStore(), ...migrated };
   store.documents = Array.isArray(store.documents) ? store.documents.map((document) => ({
     ...document,
     tags: uniqueStrings(document.tags),
@@ -187,20 +207,45 @@ function normalizeStore(rawStore) {
     }
   }
   store.knowledgeSnapshots = Array.isArray(store.knowledgeSnapshots) ? store.knowledgeSnapshots : [];
-  store.schemaVersion = 3;
+  store.schemaVersion = 4;
   return store;
 }
 
 async function readStore() {
   try {
     return normalizeStore(JSON.parse(await fs.readFile(storePath, "utf8")));
-  } catch {
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
     return defaultStore();
   }
 }
 
 async function writeStore(store) {
-  await fs.writeFile(storePath, JSON.stringify(normalizeStore(store), null, 2) + "\n", "utf8");
+  await atomicWriteJson(storePath, normalizeStore(store));
+}
+
+async function ensureStoreMigrated() {
+  let rawContent;
+  try {
+    rawContent = await fs.readFile(storePath, "utf8");
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+    await atomicWriteJson(storePath, defaultStore());
+    return;
+  }
+  const parsed = JSON.parse(rawContent);
+  const migration = migrateStoreToV4(parsed);
+  if (!migration.migrated) return;
+  const normalized = normalizeStore(migration.store);
+  const result = await persistStoreMigration({
+    storePath,
+    migrationsDirectory,
+    rawContent,
+    migratedStore: normalized,
+    fromVersion: migration.fromVersion,
+    toVersion: migration.toVersion
+  });
+  console.log("Store migrated to schema v" + migration.toVersion + "; backup: " + result.backupPath);
 }
 
 function maskSecret(value = "") {
@@ -2097,6 +2142,10 @@ app.post("/api/export", async (req, res) => {
   res.json({ fileName, markdown });
 });
 
-app.listen(port, "127.0.0.1", () => {
-  console.log("Brainstorm review API running at http://127.0.0.1:" + port);
+await ensureStoreMigrated();
+
+const server = app.listen(port, "127.0.0.1", () => {
+  const address = server.address();
+  const activePort = typeof address === "object" && address ? address.port : port;
+  console.log("Brainstorm review API running at http://127.0.0.1:" + activePort);
 });
