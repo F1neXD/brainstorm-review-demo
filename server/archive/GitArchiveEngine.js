@@ -232,23 +232,69 @@ export class GitArchiveEngine extends ArchiveEngine {
   async createCandidate({ baseRevision, patchText, candidateId, label = "候选版本" }) {
     await this.initialize();
     const id = safeId(candidateId, "candidateId");
+    const ref = "refs/archive/candidates/" + id;
+    const existing = await this.runGit(["show-ref", "--verify", "--quiet", ref], { allowExitCodes: [1] });
+    if (existing.exitCode === 0) {
+      const revision = String((await this.runGit(["rev-parse", ref])).stdout).trim();
+      return { id, revision, baseRevision, ref, existing: true };
+    }
     const candidatePath = path.join(this.candidateRoot, id);
     const patchPath = path.join(this.patchRoot, id + ".patch");
     await this.removeManagedWorktree(candidatePath);
     await fs.writeFile(patchPath, String(patchText || ""), "utf8");
     try {
       await this.runGit(["worktree", "add", "--detach", candidatePath, String(baseRevision)]);
-      await this.runGit(["apply", "--index", "--recount", "--unidiff-zero", "--whitespace=nowarn", patchPath], { cwd: candidatePath });
-      const staged = await this.runGit(["diff", "--cached", "--quiet"], { cwd: candidatePath, allowExitCodes: [1] });
-      if (staged.exitCode === 0) throw new Error("候选补丁没有产生内容变化。");
-      await this.runGit(["commit", "-m", String(label || "候选版本").slice(0, 200)], { cwd: candidatePath });
+      if (String(patchText || "").trim()) {
+        await this.runGit(["apply", "--index", "--recount", "--unidiff-zero", "--whitespace=nowarn", patchPath], { cwd: candidatePath });
+        const staged = await this.runGit(["diff", "--cached", "--quiet"], { cwd: candidatePath, allowExitCodes: [1] });
+        if (staged.exitCode === 0) throw new Error("候选补丁没有产生内容变化。");
+        await this.runGit(["commit", "-m", String(label || "候选版本").slice(0, 200)], { cwd: candidatePath });
+      }
       const revision = String((await this.runGit(["rev-parse", "HEAD"], { cwd: candidatePath })).stdout).trim();
-      await this.runGit(["update-ref", "refs/archive/candidates/" + id, revision, ZERO_SHA]);
-      return { id, revision, baseRevision, ref: "refs/archive/candidates/" + id };
+      await this.runGit(["update-ref", ref, revision, ZERO_SHA]);
+      return { id, revision, baseRevision, ref, existing: false };
     } finally {
       await this.removeManagedWorktree(candidatePath);
       await fs.rm(patchPath, { force: true });
     }
+  }
+
+  async filePatch({ fromRevision, toRevision, beforePath = "", afterPath = "" }) {
+    await this.initialize();
+    const paths = [...new Set([beforePath, afterPath].filter(Boolean).map(normalizeRepositoryPath))];
+    const result = await this.runGit([
+      "diff",
+      "--binary",
+      "--full-index",
+      "--find-renames=50%",
+      String(fromRevision),
+      String(toRevision),
+      "--",
+      ...paths
+    ]);
+    return String(result.stdout || "");
+  }
+
+  async manifestAtRevision(revision) {
+    await this.initialize();
+    const result = await this.runGit(["ls-tree", "-r", "-z", "--long", String(revision)]);
+    const records = String(result.stdout || "").split("\0").filter(Boolean);
+    const manifest = [];
+    for (const record of records) {
+      const tabIndex = record.indexOf("\t");
+      if (tabIndex < 0) continue;
+      const metadata = record.slice(0, tabIndex).trim().split(/\s+/);
+      const filePath = normalizeRepositoryPath(record.slice(tabIndex + 1));
+      if (metadata[1] !== "blob") continue;
+      const content = await this.readFile({ revision, filePath, binary: true });
+      manifest.push({
+        sourcePath: filePath,
+        contentHash: crypto.createHash("sha256").update(content).digest("hex"),
+        size: content.length,
+        gitBlob: metadata[2]
+      });
+    }
+    return manifest.sort((left, right) => left.sourcePath.localeCompare(right.sourcePath, "zh-CN"));
   }
 
   async publish({ revision, releaseId }) {

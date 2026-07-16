@@ -123,7 +123,7 @@ export class ChangeSetService {
           unitIds: []
         };
 
-        if (fileRecord.text) {
+        if (fileRecord.text && fileChange.type !== "renamed") {
           const patch = structuredPatch(
             beforePath ? "a/" + beforePath : "/dev/null",
             afterPath ? "b/" + afterPath : "/dev/null",
@@ -138,6 +138,7 @@ export class ChangeSetService {
             const rawPatch = formatPatch({ ...patch, hunks: [hunk] });
             const texts = hunkTexts(hunk.lines);
             const unitId = stableId("changeunit", changeSetId, fileChangeId, index, rawPatch);
+            const fingerprint = stableId("fingerprint", familyId, beforePath, afterPath, rawPatch);
             units.push({
               id: unitId,
               changeSetId,
@@ -157,6 +158,7 @@ export class ChangeSetService {
               afterText: texts.afterText,
               rawPatch,
               patchHash: crypto.createHash("sha256").update(rawPatch).digest("hex"),
+              fingerprint,
               summary: summarizeHunk(hunk, displayPath),
               adoptionState: "待审阅",
               assignmentState: "未归属",
@@ -170,6 +172,15 @@ export class ChangeSetService {
         }
         if (!fileRecord.unitIds.length) {
           const unitId = stableId("changeunit", changeSetId, fileChangeId, "file");
+          const fingerprint = stableId(
+            "fingerprint",
+            familyId,
+            fileChange.type,
+            beforePath,
+            afterPath,
+            baselineFile?.contentHash,
+            targetFile?.contentHash
+          );
           units.push({
             id: unitId,
             changeSetId,
@@ -190,6 +201,7 @@ export class ChangeSetService {
               beforePath,
               afterPath
             },
+            fingerprint,
             summary: path.basename(displayPath) + " · " + fileChange.type,
             adoptionState: "待审阅",
             assignmentState: "未归属",
@@ -201,6 +213,20 @@ export class ChangeSetService {
           fileRecord.unitIds.push(unitId);
         }
         fileChanges.push(fileRecord);
+      }
+
+      const previousByFingerprint = new Map();
+      for (const previous of [...store.changeUnits].sort((left, right) => String(right.updatedAt).localeCompare(String(left.updatedAt)))) {
+        if (previous.fingerprint && !previousByFingerprint.has(previous.fingerprint)) {
+          previousByFingerprint.set(previous.fingerprint, previous);
+        }
+      }
+      for (const unit of units) {
+        const previous = previousByFingerprint.get(unit.fingerprint);
+        if (!["暂时搁置", "不纳入"].includes(previous?.adoptionState)) continue;
+        unit.adoptionState = previous.adoptionState;
+        unit.carriedFromUnitId = previous.id;
+        unit.decisionNote = previous.decisionNote || "";
       }
 
       const changeSet = {
@@ -327,6 +353,309 @@ export class ChangeSetService {
     });
   }
 
+  leafUnits(units) {
+    return units.filter((entry) => entry.adoptionState !== "拆分后处理");
+  }
+
+  invalidateCandidate(changeSet) {
+    if (!changeSet.candidate || changeSet.candidate.stale) return;
+    changeSet.candidateHistory = [...(changeSet.candidateHistory || []), { ...changeSet.candidate, stale: true, staleAt: this.clock() }];
+    changeSet.candidate = { ...changeSet.candidate, stale: true, staleAt: this.clock() };
+  }
+
+  refreshDecisionState(store, changeSet) {
+    const units = store.changeUnits.filter((entry) => entry.changeSetId === changeSet.id);
+    const leaves = this.leafUnits(units);
+    changeSet.changeUnitIds = unique(units.map((entry) => entry.id));
+    changeSet.unassignedUnitIds = leaves.filter((entry) => entry.assignmentState === "未归属").map((entry) => entry.id);
+    const pending = leaves.filter((entry) => entry.adoptionState === "待审阅").length;
+    changeSet.status = changeSet.candidate && !changeSet.candidate.stale
+      ? "候选已生成"
+      : pending
+        ? "待审阅"
+        : "决策完成";
+    changeSet.updatedAt = this.clock();
+    return { units, leaves };
+  }
+
+  recordAdoptionDecision(store, unit, previousState, nextState, note) {
+    const decidedAt = this.clock();
+    const decision = {
+      id: stableId("decision", unit.id, store.adoptionDecisions.length, decidedAt, nextState),
+      changeSetId: unit.changeSetId,
+      changeUnitId: unit.id,
+      previousState,
+      decision: nextState,
+      note: String(note || ""),
+      decidedAt
+    };
+    store.adoptionDecisions.push(decision);
+    return decision;
+  }
+
+  applyAdoptionDecision(store, changeSet, unit, adoptionState, note) {
+    const allowed = ["待审阅", "纳入本版", "暂时搁置", "不纳入"];
+    if (!allowed.includes(adoptionState)) throw new Error("采纳状态无效。");
+    if (unit.adoptionState === "拆分后处理") throw new Error("该差异块已经拆分，请处理子差异块。");
+    const previousState = unit.adoptionState || "待审阅";
+    unit.adoptionState = adoptionState;
+    unit.decisionNote = String(note || "");
+    unit.updatedAt = this.clock();
+    const decision = this.recordAdoptionDecision(store, unit, previousState, adoptionState, note);
+    this.invalidateCandidate(changeSet);
+    return decision;
+  }
+
+  async setAdoptionDecision(unitId, { adoptionState, note = "" }) {
+    return this.versionWorkspace.enqueue(async () => {
+      const store = await this.readStore();
+      const unit = store.changeUnits.find((entry) => entry.id === unitId);
+      if (!unit) throw new Error("差异块不存在。");
+      const changeSet = store.changeSets.find((entry) => entry.id === unit.changeSetId);
+      const decision = this.applyAdoptionDecision(store, changeSet, unit, adoptionState, note);
+      this.refreshDecisionState(store, changeSet);
+      await this.writeStore(store);
+      return { unit, decision, changeSet: this.presentChangeSet(store, changeSet) };
+    });
+  }
+
+  async setFileAdoptionDecision(changeSetId, fileChangeId, { adoptionState, note = "" }) {
+    return this.versionWorkspace.enqueue(async () => {
+      const store = await this.readStore();
+      const changeSet = store.changeSets.find((entry) => entry.id === changeSetId);
+      if (!changeSet) throw new Error("变更集不存在。");
+      const fileUnits = this.leafUnits(store.changeUnits.filter((entry) => (
+        entry.changeSetId === changeSetId && entry.fileChangeId === fileChangeId
+      )));
+      if (!fileUnits.length) throw new Error("文件变化不存在可处理的差异块。");
+      const decisions = fileUnits.map((unit) => this.applyAdoptionDecision(store, changeSet, unit, adoptionState, note));
+      this.refreshDecisionState(store, changeSet);
+      await this.writeStore(store);
+      return { decisions, changeSet: this.presentChangeSet(store, changeSet) };
+    });
+  }
+
+  async setSemanticGroupAdoptionDecision(changeSetId, semanticGroupId, { adoptionState, note = "" }) {
+    return this.versionWorkspace.enqueue(async () => {
+      const store = await this.readStore();
+      const changeSet = store.changeSets.find((entry) => entry.id === changeSetId);
+      const group = changeSet?.semanticGroups?.find((entry) => entry.id === semanticGroupId);
+      if (!group) throw new Error("语义变更组不存在。");
+      const groupIds = new Set(group.unitIds || []);
+      const groupUnits = this.leafUnits(store.changeUnits.filter((entry) => entry.changeSetId === changeSetId && groupIds.has(entry.id)));
+      const decisions = groupUnits.map((unit) => this.applyAdoptionDecision(store, changeSet, unit, adoptionState, note));
+      this.refreshDecisionState(store, changeSet);
+      await this.writeStore(store);
+      return { decisions, changeSet: this.presentChangeSet(store, changeSet) };
+    });
+  }
+
+  async splitUnit(unitId) {
+    return this.versionWorkspace.enqueue(async () => {
+      const store = await this.readStore();
+      const unit = store.changeUnits.find((entry) => entry.id === unitId);
+      if (!unit) throw new Error("差异块不存在。");
+      if (unit.unitType !== "text-hunk") throw new Error("只有文本差异块可以继续拆分。");
+      if (unit.adoptionState === "拆分后处理") {
+        const existingChildren = store.changeUnits.filter((entry) => entry.parentUnitId === unit.id);
+        return { parent: unit, children: existingChildren, changeSet: this.presentChangeSet(store, store.changeSets.find((entry) => entry.id === unit.changeSetId)) };
+      }
+      const beforeBuffer = unit.beforeRevisionId ? (await this.versionWorkspace.readRevision(unit.beforeRevisionId)).content : Buffer.alloc(0);
+      const afterBuffer = unit.afterRevisionId ? (await this.versionWorkspace.readRevision(unit.afterRevisionId)).content : Buffer.alloc(0);
+      const patch = structuredPatch(
+        unit.beforePath ? "a/" + unit.beforePath : "/dev/null",
+        unit.afterPath ? "b/" + unit.afterPath : "/dev/null",
+        beforeBuffer.toString("utf8"),
+        afterBuffer.toString("utf8"),
+        "",
+        "",
+        { context: 0 }
+      );
+      const oldEnd = unit.oldStart + Math.max(unit.oldLines, 1) - 1;
+      const newEnd = unit.newStart + Math.max(unit.newLines, 1) - 1;
+      const childHunks = patch.hunks.filter((hunk) => {
+        const hunkOldEnd = hunk.oldStart + Math.max(hunk.oldLines, 1) - 1;
+        const hunkNewEnd = hunk.newStart + Math.max(hunk.newLines, 1) - 1;
+        const oldOverlap = hunk.oldStart <= oldEnd && hunkOldEnd >= unit.oldStart;
+        const newOverlap = hunk.newStart <= newEnd && hunkNewEnd >= unit.newStart;
+        return oldOverlap || newOverlap;
+      });
+      if (childHunks.length <= 1) throw new Error("该差异块已经是最小可采纳单位。");
+      const children = childHunks.map((hunk, index) => {
+        const rawPatch = formatPatch({ ...patch, hunks: [hunk] });
+        const texts = hunkTexts(hunk.lines);
+        return {
+          ...unit,
+          id: stableId("changeunit", unit.id, "child", index, rawPatch),
+          parentUnitId: unit.id,
+          childIndex: index,
+          oldStart: hunk.oldStart,
+          oldLines: hunk.oldLines,
+          newStart: hunk.newStart,
+          newLines: hunk.newLines,
+          beforeText: texts.beforeText,
+          afterText: texts.afterText,
+          rawPatch,
+          patchHash: crypto.createHash("sha256").update(rawPatch).digest("hex"),
+          fingerprint: stableId("fingerprint", unit.familyId, unit.beforePath, unit.afterPath, rawPatch),
+          summary: summarizeHunk(hunk, unit.afterPath || unit.beforePath),
+          adoptionState: "待审阅",
+          splitChildIds: undefined,
+          createdAt: this.clock(),
+          updatedAt: this.clock()
+        };
+      });
+      unit.adoptionState = "拆分后处理";
+      unit.splitChildIds = children.map((entry) => entry.id);
+      unit.updatedAt = this.clock();
+      store.changeUnits.push(...children);
+      const changeSet = store.changeSets.find((entry) => entry.id === unit.changeSetId);
+      const fileChange = changeSet.fileChanges.find((entry) => entry.id === unit.fileChangeId);
+      fileChange.unitIds = unique([...(fileChange.unitIds || []), ...children.map((entry) => entry.id)]);
+      this.recordAdoptionDecision(store, unit, "待审阅", "拆分后处理", "拆分为更小差异块");
+      this.invalidateCandidate(changeSet);
+      this.refreshDecisionState(store, changeSet);
+      await this.writeStore(store);
+      return { parent: unit, children, changeSet: this.presentChangeSet(store, changeSet) };
+    });
+  }
+
+  async buildCandidate(changeSetId) {
+    return this.versionWorkspace.enqueue(async () => {
+      const store = await this.readStore();
+      const changeSet = store.changeSets.find((entry) => entry.id === changeSetId);
+      if (!changeSet) throw new Error("变更集不存在。");
+      const release = store.canonReleases.find((entry) => entry.id === changeSet.baselineReleaseId);
+      const targetCheckpoint = store.checkpoints.find((entry) => entry.id === changeSet.targetCheckpointId);
+      if (!release || !targetCheckpoint) throw new Error("变更集缺少基线或目标检查点。");
+      const units = store.changeUnits.filter((entry) => entry.changeSetId === changeSetId);
+      const leaves = this.leafUnits(units);
+      const pending = leaves.filter((entry) => entry.adoptionState === "待审阅");
+      if (pending.length) throw new Error("仍有 " + pending.length + " 个差异块待决定。");
+      const accepted = leaves.filter((entry) => entry.adoptionState === "纳入本版");
+      const decisionHash = crypto.createHash("sha256").update(JSON.stringify(
+        leaves.map((entry) => [entry.fingerprint, entry.adoptionState]).sort((left, right) => left[0].localeCompare(right[0]))
+      )).digest("hex");
+      if (changeSet.candidate && !changeSet.candidate.stale && changeSet.candidate.decisionHash === decisionHash) {
+        return { candidate: changeSet.candidate, changeSet: this.presentChangeSet(store, changeSet) };
+      }
+
+      const patches = [];
+      const fullPatchFiles = new Set();
+      for (const unit of accepted) {
+        if (unit.rawPatch) {
+          patches.push(unit.rawPatch);
+          continue;
+        }
+        if (fullPatchFiles.has(unit.fileChangeId)) continue;
+        const patchText = await this.versionWorkspace.getArchiveFilePatch({
+          fromRevision: release.archiveRevision,
+          toRevision: targetCheckpoint.archiveRevision,
+          beforePath: unit.beforePath,
+          afterPath: unit.afterPath
+        });
+        if (!patchText.trim()) throw new Error("无法生成文件级候选补丁：" + (unit.afterPath || unit.beforePath));
+        patches.push(patchText);
+        fullPatchFiles.add(unit.fileChangeId);
+      }
+      const candidateId = "candidate_" + stableId("selection", release.id, decisionHash).slice(-20);
+      const archiveCandidate = await this.versionWorkspace.createArchiveCandidate({
+        baseRevision: release.archiveRevision,
+        patchText: patches.join("\n"),
+        candidateId,
+        label: changeSet.title + " · 候选"
+      });
+      const archiveManifest = await this.versionWorkspace.getArchiveManifest(archiveCandidate.revision);
+      const baselineByPath = new Map((release.manifest || []).map((entry) => [pathKey(entry.sourcePath), entry]));
+      const targetByPath = new Map((targetCheckpoint.files || []).map((entry) => [pathKey(entry.sourcePath), entry]));
+      const familyById = new Map(store.documentFamilies.map((entry) => [entry.id, entry]));
+      const revisionByFamilyHash = new Map(store.documentRevisions
+        .filter((entry) => entry.familyId && entry.contentHash)
+        .map((entry) => [entry.familyId + ":" + entry.contentHash, entry]));
+      const checkpointId = "checkpoint_" + candidateId;
+      const candidateFiles = [];
+      const candidateRevisionIds = [];
+      for (const file of archiveManifest) {
+        const source = targetByPath.get(pathKey(file.sourcePath)) || baselineByPath.get(pathKey(file.sourcePath));
+        if (!source?.familyId) throw new Error("候选文件无法关联文档族：" + file.sourcePath);
+        const family = familyById.get(source.familyId);
+        let revision = revisionByFamilyHash.get(source.familyId + ":" + file.contentHash);
+        if (!revision) {
+          revision = {
+            id: stableId("revision", source.familyId, file.contentHash),
+            familyId: source.familyId,
+            documentId: source.documentId || "",
+            contentHash: file.contentHash,
+            sourcePath: file.sourcePath,
+            size: file.size,
+            mtime: this.clock(),
+            archiveRevision: archiveCandidate.revision,
+            objectLocator: { type: "git", revision: archiveCandidate.revision, path: file.sourcePath },
+            versionState: "工作草稿",
+            checkpointIds: [],
+            legacySnapshotIds: [],
+            createdAt: this.clock()
+          };
+          store.documentRevisions.push(revision);
+          revisionByFamilyHash.set(source.familyId + ":" + file.contentHash, revision);
+        }
+        revision.checkpointIds = unique([...(revision.checkpointIds || []), checkpointId]);
+        candidateRevisionIds.push(revision.id);
+        const document = store.documents.find((entry) => entry.id === source.documentId)
+          || store.documents.find((entry) => entry.documentFamilyId === source.familyId);
+        candidateFiles.push({
+          documentId: source.documentId || document?.id || "",
+          familyId: source.familyId,
+          revisionId: revision.id,
+          sourcePath: file.sourcePath,
+          contentHash: file.contentHash,
+          size: file.size,
+          title: document?.title || family?.title || path.basename(file.sourcePath),
+          knowledgeStatus: document?.knowledgeStatus || source.knowledgeStatus || "参考"
+        });
+      }
+      if (!store.checkpoints.some((entry) => entry.id === checkpointId)) {
+        store.checkpoints.push({
+          id: checkpointId,
+          label: changeSet.title + " · 候选",
+          purpose: "candidate",
+          origin: "git-archive",
+          status: "候选",
+          visible: false,
+          workspacePath: store.knowledgeFolder,
+          archiveRevision: archiveCandidate.revision,
+          previousCheckpointId: release.checkpointId,
+          revisionIds: unique(candidateRevisionIds),
+          files: candidateFiles,
+          fileCount: candidateFiles.length,
+          eventCount: 0,
+          capturedArchiveRevisions: [archiveCandidate.revision],
+          createdAt: this.clock()
+        });
+      }
+      const candidate = {
+        id: candidateId,
+        checkpointId,
+        archiveRevision: archiveCandidate.revision,
+        archiveRef: archiveCandidate.ref,
+        decisionHash,
+        manifestHash: crypto.createHash("sha256").update(JSON.stringify(candidateFiles)).digest("hex"),
+        acceptedUnitIds: accepted.map((entry) => entry.id),
+        deferredUnitIds: leaves.filter((entry) => entry.adoptionState === "暂时搁置").map((entry) => entry.id),
+        rejectedUnitIds: leaves.filter((entry) => entry.adoptionState === "不纳入").map((entry) => entry.id),
+        fileCount: candidateFiles.length,
+        stale: false,
+        createdAt: this.clock()
+      };
+      if (changeSet.candidate) changeSet.candidateHistory = [...(changeSet.candidateHistory || []), changeSet.candidate];
+      changeSet.candidate = candidate;
+      changeSet.status = "候选已生成";
+      changeSet.updatedAt = this.clock();
+      await this.writeStore(store);
+      return { candidate, checkpoint: store.checkpoints.find((entry) => entry.id === checkpointId), changeSet: this.presentChangeSet(store, changeSet) };
+    });
+  }
+
   async listChangeSets() {
     const store = await this.readStore();
     return [...store.changeSets]
@@ -343,16 +672,22 @@ export class ChangeSetService {
 
   presentChangeSet(store, changeSet) {
     const units = store.changeUnits.filter((entry) => entry.changeSetId === changeSet.id);
+    const leaves = this.leafUnits(units);
     return {
       ...changeSet,
       units,
       counts: {
         files: changeSet.fileChanges?.length || 0,
-        units: units.length,
-        unassigned: units.filter((entry) => entry.assignmentState === "未归属").length,
-        grouped: units.filter((entry) => entry.assignmentState === "已归组").length,
-        linked: units.filter((entry) => entry.assignmentState === "已关联会议").length,
-        unrelated: units.filter((entry) => entry.assignmentState === "无关变化").length
+        units: leaves.length,
+        splitParents: units.length - leaves.length,
+        pendingDecision: leaves.filter((entry) => entry.adoptionState === "待审阅").length,
+        accepted: leaves.filter((entry) => entry.adoptionState === "纳入本版").length,
+        deferred: leaves.filter((entry) => entry.adoptionState === "暂时搁置").length,
+        rejected: leaves.filter((entry) => entry.adoptionState === "不纳入").length,
+        unassigned: leaves.filter((entry) => entry.assignmentState === "未归属").length,
+        grouped: leaves.filter((entry) => entry.assignmentState === "已归组").length,
+        linked: leaves.filter((entry) => entry.assignmentState === "已关联会议").length,
+        unrelated: leaves.filter((entry) => entry.assignmentState === "无关变化").length
       }
     };
   }

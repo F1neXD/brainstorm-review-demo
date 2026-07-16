@@ -2037,6 +2037,55 @@ app.patch("/api/versioning/change-units/:id/assignment", async (req, res) => {
   }
 });
 
+app.patch("/api/versioning/change-units/:id/adoption", async (req, res) => {
+  try {
+    res.json(await changeSetService.setAdoptionDecision(req.params.id, {
+      adoptionState: String(req.body?.adoptionState || ""),
+      note: String(req.body?.note || "")
+    }));
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.post("/api/versioning/change-units/:id/split", async (req, res) => {
+  try {
+    res.json(await changeSetService.splitUnit(req.params.id));
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.patch("/api/versioning/change-sets/:id/files/:fileChangeId/adoption", async (req, res) => {
+  try {
+    res.json(await changeSetService.setFileAdoptionDecision(req.params.id, req.params.fileChangeId, {
+      adoptionState: String(req.body?.adoptionState || ""),
+      note: String(req.body?.note || "")
+    }));
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.patch("/api/versioning/change-sets/:id/semantic-groups/:groupId/adoption", async (req, res) => {
+  try {
+    res.json(await changeSetService.setSemanticGroupAdoptionDecision(req.params.id, req.params.groupId, {
+      adoptionState: String(req.body?.adoptionState || ""),
+      note: String(req.body?.note || "")
+    }));
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.post("/api/versioning/change-sets/:id/candidate", async (req, res) => {
+  try {
+    res.json(await changeSetService.buildCandidate(req.params.id));
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
 app.get("/api/versioning/revisions/:id/content", async (req, res) => {
   try {
     const result = await versionWorkspace.readRevision(req.params.id);
