@@ -42,6 +42,7 @@ import {
   X
 } from "lucide-react";
 import { createRoot } from "react-dom/client";
+import VersionWorkspace from "./VersionWorkspace.jsx";
 import "./styles.css";
 
 const apiBase = import.meta.env.VITE_API_BASE || "http://127.0.0.1:8787";
@@ -412,10 +413,10 @@ function App() {
       const result = await request("/api/change-packages/from-session/" + selectedSessionId, { method: "POST" });
       await refreshAll();
       return result;
-    }, "变更包已生成");
+    }, "落实清单已生成");
     if (data?.changePackage) {
       setSelectedPackageId(data.changePackage.id);
-      setActiveTab("packages");
+      setActiveTab("version");
     }
   }
 
@@ -562,17 +563,17 @@ function App() {
 
   const tabs = [
     ["review", "审阅", ClipboardCheck],
+    ["version", "版本", Layers3],
     ["knowledge", "知识库", BookOpen],
-    ["records", "会议记录", Archive],
-    ["packages", "变更包", PackageCheck],
+    ["records", "会议", Archive],
     ["settings", "设置", KeyRound]
   ];
 
   const pageMeta = {
     review: ["当前会议", selectedSession?.title || "新会议"],
+    version: ["版本", "版本工作区"],
     knowledge: ["知识库", documents.length + " 份策划资料"],
-    records: ["会议记录", sessions.length + " 次审阅"],
-    packages: ["变更包", changePackages.length + " 个落实计划"],
+    records: ["会议", sessions.length + " 次审阅"],
     settings: ["设置", "模型与连接"]
   }[activeTab];
 
@@ -642,7 +643,7 @@ function App() {
               openPackage={() => {
                 const found = changePackages.find((entry) => entry.sessionId === selectedSessionId);
                 if (found) setSelectedPackageId(found.id);
-                setActiveTab("packages");
+                setActiveTab("version");
               }}
               exportMarkdown={exportMarkdown}
             />
@@ -675,22 +676,17 @@ function App() {
             />
           )}
 
-          {activeTab === "packages" && (
-            <PackagesWorkspace
+          {activeTab === "version" && (
+            <VersionWorkspace
+              request={request}
               packages={changePackages}
               sessions={sessions}
-              selectedPackage={selectedPackage}
+              selectedPackageId={selectedPackageId}
               setSelectedPackageId={setSelectedPackageId}
-              updatePackage={updatePackage}
-              updateWorkItem={updateWorkItem}
-              updateDocumentTask={updateDocumentTask}
-              lockPackageBaseline={lockPackageBaseline}
-              verifyPackage={verifyPackage}
-              updateVerificationResult={updateVerificationResult}
-              updateDecisionOutcome={updateDecisionOutcome}
-              deletePackage={deletePackage}
+              refreshAll={refreshAll}
               openSession={openSession}
-              loading={loading}
+              notify={setMessage}
+              reportError={setError}
             />
           )}
 
@@ -926,10 +922,10 @@ function ReviewOverview({ summary, createChangePackage, hasPackage, openPackage,
           <div className="overview-actions">
             <button className="quiet-action" onClick={exportMarkdown}><Download size={16} /> 导出</button>
             {hasPackage ? (
-              <button className="primary-action" onClick={openPackage}><PackageCheck size={17} /> 查看变更包</button>
+              <button className="primary-action" onClick={openPackage}><PackageCheck size={17} /> 查看落实清单</button>
             ) : (
               <button className="primary-action" onClick={createChangePackage} disabled={!summary.accepted}>
-                <PackageCheck size={17} /> 生成变更包
+                <PackageCheck size={17} /> 生成落实清单
                 {summary.accepted > 0 && <span className="button-count">{summary.accepted}</span>}
               </button>
             )}
