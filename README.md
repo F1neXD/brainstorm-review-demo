@@ -35,6 +35,7 @@ npm test
 - 模型设置保存在项目根目录的 `.env`。
 - 会议、审阅项和变更包保存在 `data/store.json`。
 - 每次分析的修改前版本和每轮验证版本保存在 `data/snapshots`，内容按 SHA-256 去重。
+- 工作区修订和检查点保存在 `data/version-archive` 的独立 Git 镜像中；源知识库始终只读。
 - 上传文件保存在 `data/uploads`。
 - 手动导出的 Markdown 保存在 `data/outputs`。
 - 本地知识库始终只读扫描，不会自动修改源文件。
