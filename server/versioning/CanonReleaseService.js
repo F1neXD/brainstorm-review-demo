@@ -453,6 +453,123 @@ export class CanonReleaseService {
     return summaries.map((entry) => "- " + entry).join("\n");
   }
 
+  meetingVerificationGate(store, changeSet, candidate) {
+    const packageIds = new Set(array(changeSet.sourceChangePackageIds));
+    const packages = store.changePackages.filter((entry) => (
+      packageIds.has(entry.id) || entry.workspaceChangeSetId === changeSet.id
+    ));
+    const failures = [];
+    for (const changePackage of packages) {
+      const run = [...array(changePackage.verificationRuns)]
+        .reverse()
+        .find((entry) => entry.mode === "canonical-candidate" && entry.candidateId === candidate.id);
+      if (!run) {
+        failures.push(changePackage.id + ":缺少候选版验证");
+        continue;
+      }
+      const currentLinkageHash = hashJson(array(changePackage.decisionChecklist).map((decision) => {
+        const linkedIds = new Set(array(decision.linkedChangeUnitIds));
+        const linkedUnits = store.changeUnits.filter((entry) => (
+          entry.changeSetId === changeSet.id
+          && entry.adoptionState !== "拆分后处理"
+          && (linkedIds.has(entry.id) || entry.sourceReviewItemId === decision.reviewItemId)
+        ));
+        return {
+          checklistId: decision.id,
+          units: linkedUnits.map((entry) => [entry.id, entry.adoptionState]).sort((left, right) => left[0].localeCompare(right[0]))
+        };
+      }).sort((left, right) => left.checklistId.localeCompare(right.checklistId)));
+      if (run.linkageHash !== currentLinkageHash) {
+        failures.push(changePackage.id + ":差异关联已变化，请重新验证");
+        continue;
+      }
+      const resultByChecklist = new Map(array(run.results).map((entry) => [entry.checklistId, entry]));
+      for (const decision of array(changePackage.decisionChecklist)) {
+        const result = resultByChecklist.get(decision.id);
+        const linkedIds = new Set(array(decision.linkedChangeUnitIds));
+        const linkedUnits = store.changeUnits.filter((entry) => (
+          entry.changeSetId === changeSet.id
+          && (linkedIds.has(entry.id) || entry.sourceReviewItemId === decision.reviewItemId)
+        ));
+        const acceptedLinked = linkedUnits.some((entry) => entry.adoptionState === "纳入本版");
+        if (!result) {
+          failures.push(decision.id + ":缺少验证结果");
+        } else if (decision.decisionStatus === "纳入变更" && !(
+          result.status === "已落实" && result.humanStatus === "确认完成" && array(result.afterEvidence).length > 0
+        )) {
+          failures.push(decision.id + ":纳入结果未确认完成");
+        } else if (decision.decisionStatus === "暂不纳入" && !(
+          result.status === "保持不纳入" && result.humanStatus === "确认完成" && array(result.afterEvidence).length > 0
+        )) {
+          failures.push(decision.id + ":不纳入结果未确认");
+        } else if (decision.decisionStatus === "需澄清" && (
+          acceptedLinked || !["可重新决策", "仍需澄清"].includes(result.status)
+        )) {
+          failures.push(decision.id + ":澄清项仍含已采纳变化或验证异常");
+        } else if (decision.decisionStatus === "待审") {
+          failures.push(decision.id + ":会议结论仍待审阅");
+        }
+      }
+    }
+    return {
+      id: "meeting-candidate-verified",
+      label: "关联会议结论已验证",
+      passed: failures.length === 0,
+      details: failures
+    };
+  }
+
+  applyMeetingClosure(store, changeSet, release) {
+    const packageIds = new Set(array(changeSet.sourceChangePackageIds));
+    const packages = store.changePackages.filter((entry) => (
+      packageIds.has(entry.id) || entry.workspaceChangeSetId === changeSet.id
+    ));
+    for (const changePackage of packages) {
+      const run = [...array(changePackage.verificationRuns)]
+        .reverse()
+        .find((entry) => entry.mode === "canonical-candidate" && entry.candidateId === changeSet.candidate.id);
+      const resultByChecklist = new Map(array(run?.results).map((entry) => [entry.checklistId, entry]));
+      let requiresRedecision = false;
+      for (const decision of array(changePackage.decisionChecklist)) {
+        const result = resultByChecklist.get(decision.id);
+        const reviewItem = store.reviewItems.find((entry) => entry.id === decision.reviewItemId);
+        if (!reviewItem) continue;
+        if (decision.decisionStatus === "需澄清") {
+          reviewItem.versionClosureState = "待重新决策";
+          reviewItem.redecisionSourceReleaseId = release.id;
+          reviewItem.redecisionReason = result?.summary || decision.expectedOutcome;
+          requiresRedecision = true;
+          continue;
+        }
+        const closed = (
+          decision.decisionStatus === "纳入变更" && result?.status === "已落实" && result?.humanStatus === "确认完成"
+        ) || (
+          decision.decisionStatus === "暂不纳入" && result?.status === "保持不纳入" && result?.humanStatus === "确认完成"
+        );
+        if (closed) {
+          reviewItem.versionClosureState = "已随正式版关闭";
+          reviewItem.closedReleaseId = release.id;
+          reviewItem.closedChangeSetId = changeSet.id;
+          reviewItem.closedAt = release.publishedAt;
+        }
+      }
+      changePackage.publishedReleaseId = release.id;
+      changePackage.releaseStatus = requiresRedecision ? "已发布，待重新决策" : "已随正式版关闭";
+      changePackage.versionStatus = changePackage.releaseStatus;
+      changePackage.updatedAt = release.publishedAt;
+      const session = store.sessions.find((entry) => entry.id === changePackage.sessionId);
+      if (session) {
+        const sessionItems = store.reviewItems.filter((entry) => entry.sessionId === session.id);
+        session.status = sessionItems.some((entry) => entry.versionClosureState === "待重新决策")
+          ? "待重新决策"
+          : sessionItems.length && sessionItems.every((entry) => entry.closedReleaseId)
+            ? "已发布"
+            : "部分发布";
+        session.updatedAt = release.publishedAt;
+      }
+    }
+  }
+
   async prepareStore(store, changeSetId, { useModel = true } = {}) {
     const changeSet = findChangeSet(store, changeSetId);
     const candidate = changeSet.candidate;
@@ -524,7 +641,8 @@ export class CanonReleaseService {
       { id: "no-pending-decisions", label: "待审变更为 0", passed: pendingUnits.length === 0, details: pendingUnits.map((entry) => entry.id) },
       { id: "no-unresolved-conflicts", label: "未解决冲突为 0", passed: unresolvedConflicts.length === 0, details: unresolvedConflicts.map((entry) => entry.id) },
       { id: "single-formal-revision", label: "每个文档族最多一个正式修订", passed: duplicateCandidateFamilies.length === 0 && duplicateFormalFamilies.length === 0, details: unique([...duplicateCandidateFamilies, ...duplicateFormalFamilies]) },
-      { id: "accepted-after-evidence", label: "所有采纳项均有修改后证据", passed: evidence.every((entry) => entry.passed), details: evidence.filter((entry) => !entry.passed).map((entry) => entry.unitId) }
+      { id: "accepted-after-evidence", label: "所有采纳项均有修改后证据", passed: evidence.every((entry) => entry.passed), details: evidence.filter((entry) => !entry.passed).map((entry) => entry.unitId) },
+      this.meetingVerificationGate(store, changeSet, candidate)
     ];
     const versionNumber = Math.max(0, ...store.canonReleases.map((entry) => Number(entry.versionNumber || 0))) + 1;
     const previewShape = {
@@ -676,6 +794,7 @@ export class CanonReleaseService {
       currentChangeSet.status = "已发布";
       currentChangeSet.publishedReleaseId = release.id;
       currentChangeSet.publishedAt = publishedAt;
+      this.applyMeetingClosure(store, currentChangeSet, release);
       await this.writeStore(store);
       return release;
     });

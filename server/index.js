@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import { atomicWriteJson, persistStoreMigration } from "./store/persistence.js";
 import { CanonReleaseService } from "./versioning/CanonReleaseService.js";
 import { ChangeSetService } from "./versioning/ChangeSetService.js";
+import { MeetingVersionService } from "./versioning/MeetingVersionService.js";
 import { migrateStoreToV4 } from "./versioning/schema.js";
 import { VersionWorkspaceService } from "./versioning/VersionWorkspaceService.js";
 
@@ -1315,7 +1316,8 @@ function buildDecisionChecklist(items, existingChecklist = []) {
       expectedOutcome: existing?.decisionStatus === item.humanStatus && existing?.expectedOutcome
         ? existing.expectedOutcome
         : expectedOutcomeForItem(item),
-      reviewerNote: item.reviewerNote || ""
+      reviewerNote: item.reviewerNote || "",
+      linkedChangeUnitIds: existing?.linkedChangeUnitIds || []
     };
   });
 }
@@ -1334,6 +1336,7 @@ function buildChangePackage(session, allItems, existing) {
   const existingWork = new Map((existing?.workItems || []).map((item) => [item.reviewItemId, item]));
   const workItems = accepted.map((item) => defaultWorkItem(item, existingWork.get(item.id)));
   const documentUpdates = buildDocumentUpdates(accepted, existing?.documentUpdates || []);
+  const redecisionBaselineId = allItems.find((item) => item.redecisionSourceReleaseId)?.redecisionSourceReleaseId || "";
   return {
     id: existing?.id || makeId("package"),
     sessionId: session.id,
@@ -1346,6 +1349,14 @@ function buildChangePackage(session, allItems, existing) {
     blockers,
     workItems,
     documentUpdates,
+    changeSetId: existing?.changeSetId || "",
+    baselineReleaseId: existing?.baselineReleaseId || redecisionBaselineId || session.analysisMeta?.canonicalReleaseId || "",
+    workspaceChangeSetId: existing?.workspaceChangeSetId || "",
+    targetCheckpointId: existing?.targetCheckpointId || "",
+    versionStatus: existing?.versionStatus || "待修改",
+    publishedReleaseId: existing?.publishedReleaseId || "",
+    releaseStatus: existing?.releaseStatus || "",
+    parentPackageId: existing?.parentPackageId || "",
     analysisRevisionId: session.analysisMeta?.revisionId || existing?.analysisRevisionId || "",
     baselineSnapshotId: session.analysisMeta?.baselineSnapshotId || existing?.baselineSnapshotId || "",
     baselineCapturedAt: session.analysisMeta?.baselineCapturedAt || existing?.baselineCapturedAt || "",
@@ -1354,6 +1365,25 @@ function buildChangePackage(session, allItems, existing) {
     createdAt: existing?.createdAt || now(),
     updatedAt: now()
   };
+}
+
+function activeChangePackage(store, sessionId) {
+  return store.changePackages.find((entry) => entry.sessionId === sessionId && !entry.publishedReleaseId);
+}
+
+function upsertSessionChangePackage(store, session, allItems) {
+  const activeItems = allItems.filter((entry) => !entry.closedReleaseId);
+  if (!activeItems.length) return null;
+  const existing = activeChangePackage(store, session.id);
+  const changePackage = buildChangePackage(session, activeItems, existing);
+  if (existing) {
+    store.changePackages = store.changePackages.map((entry) => entry.id === existing.id ? changePackage : entry);
+  } else {
+    const latestPublished = store.changePackages.find((entry) => entry.sessionId === session.id && entry.publishedReleaseId);
+    changePackage.parentPackageId = latestPublished?.id || "";
+    store.changePackages.unshift(changePackage);
+  }
+  return changePackage;
 }
 
 function updateSessionReviewState(store, sessionId) {
@@ -1792,6 +1822,66 @@ ${JSON.stringify(conflicts.map((conflict) => ({
   };
 }
 
+async function verifyMeetingCandidateWithModel({ changePackage, contexts }) {
+  const config = modelConfiguration();
+  if (!config.apiKey) return null;
+  const prompt = `
+你要验收会议人工决定是否正确反映在候选正式版中。比较对象只允许是上一正式版、会议决定和候选正式版。
+
+规则：
+1. 只能使用输入中的 checklistId 和 statementId，不得引用工作区草稿或虚构文件。
+2. “纳入变更”检查新口径、旧口径清理和关联变化是否完整；状态只能为 已落实/部分落实/未落实/产生新冲突/无法判断。
+3. “需澄清”只能判断是否出现重新决策依据；状态只能为 可重新决策/仍需澄清/产生新冲突/无法判断，不能替用户关闭。
+4. “暂不纳入”检查内容是否误入候选版；状态只能为 保持不纳入/意外写入/产生新冲突/无法判断。
+5. 证据 ID 必须来自对应项输入。无法证明时返回“无法判断”。
+
+返回 JSON：
+{
+  "results":[
+    {"checklistId":"decision_x","status":"无法判断","confidence":"低","summary":"","beforeStatementIds":[],"afterStatementIds":[]}
+  ]
+}
+
+变更包：${JSON.stringify({ id: changePackage.id, title: changePackage.title })}
+
+验收项：
+${JSON.stringify(contexts.map((context) => ({
+  checklistId: context.decision.id,
+  title: context.decision.title,
+  originalText: context.decision.originalText,
+  decisionStatus: context.decision.decisionStatus,
+  expectedOutcome: context.decision.expectedOutcome,
+  linkedChanges: context.units.map((unit) => ({
+    unitId: unit.id,
+    sourcePath: unit.afterPath || unit.beforePath,
+    adoptionState: unit.adoptionState,
+    before: String(unit.beforeText || "").slice(0, 500),
+    after: String(unit.afterText || "").slice(0, 500)
+  })),
+  beforeStatements: context.beforeStatements.map((statement) => ({
+    statementId: statement.id,
+    sourcePath: statement.sourcePath,
+    heading: statement.heading,
+    lineStart: statement.lineStart,
+    text: statement.text
+  })),
+  candidateStatements: context.afterStatements.map((statement) => ({
+    statementId: statement.id,
+    sourcePath: statement.sourcePath,
+    heading: statement.heading,
+    lineStart: statement.lineStart,
+    text: statement.text
+  }))
+})))}
+`;
+  const result = await callModelJson(prompt);
+  const validIds = new Set(contexts.map((entry) => entry.decision.id));
+  return {
+    model: config.model,
+    results: (Array.isArray(result?.results) ? result.results : []).filter((entry) => validIds.has(String(entry?.checklistId || "")))
+  };
+}
+
 const versionWorkspace = new VersionWorkspaceService({
   archiveRoot: versionArchiveRoot,
   legacySnapshotObjectRoot: snapshotObjectDir,
@@ -1818,6 +1908,16 @@ const canonReleaseService = new CanonReleaseService({
   versionWorkspace,
   clock: now,
   conflictClassifier: classifyCanonConflictsWithModel
+});
+
+const meetingVersionService = new MeetingVersionService({
+  readStore,
+  writeStore,
+  versionWorkspace,
+  changeSetService,
+  canonReleaseService,
+  clock: now,
+  candidateVerifier: verifyMeetingCandidateWithModel
 });
 
 app.get("/api/settings", async (_req, res) => {
@@ -2274,6 +2374,14 @@ app.patch("/api/sessions/:id", async (req, res) => {
 
 app.delete("/api/sessions/:id", async (req, res) => {
   const store = await readStore();
+  const sessionItemIds = new Set(store.reviewItems.filter((entry) => entry.sessionId === req.params.id).map((entry) => entry.id));
+  const versionedPackages = store.changePackages.filter((entry) => (
+    entry.sessionId === req.params.id && (entry.workspaceChangeSetId || entry.publishedReleaseId)
+  ));
+  const linkedUnits = store.changeUnits.some((entry) => sessionItemIds.has(entry.sourceReviewItemId));
+  if (versionedPackages.length || linkedUnits) {
+    return res.status(400).json({ error: "会议已经进入版本流程，不能删除审计记录。" });
+  }
   store.sessions = store.sessions.filter((entry) => entry.id !== req.params.id);
   store.reviewItems = store.reviewItems.filter((entry) => entry.sessionId !== req.params.id);
   store.tasks = store.tasks.filter((entry) => entry.sessionId !== req.params.id);
@@ -2303,6 +2411,9 @@ app.post("/api/analyze", async (req, res) => {
       };
       store.sessions.unshift(session);
     } else {
+      if (store.changePackages.some((entry) => entry.sessionId === session.id && (entry.workspaceChangeSetId || entry.publishedReleaseId))) {
+        return res.status(400).json({ error: "该会议已经进入版本流程，请创建新的会议记录继续分析。" });
+      }
       session.title = String(req.body?.title || session.title).trim();
       session.rawText = rawText;
       session.currentGoal = String(req.body?.currentGoal ?? session.currentGoal ?? "");
@@ -2386,6 +2497,10 @@ app.patch("/api/review-items/:id", async (req, res) => {
   const store = await readStore();
   const item = store.reviewItems.find((entry) => entry.id === req.params.id);
   if (!item) return res.status(404).json({ error: "审阅项不存在。" });
+  if (item.closedReleaseId) return res.status(400).json({ error: "该会议结论已经随正式版关闭，不能修改历史决定。" });
+  if (activeChangePackage(store, item.sessionId)?.workspaceChangeSetId) {
+    return res.status(400).json({ error: "会议结论已经关联工作区变化，不能再修改原审阅决定。" });
+  }
   const previousStatus = item.humanStatus;
   for (const key of ["reviewerNote", "relationType", "decisionState", "normalizedPoint"]) {
     if (Object.prototype.hasOwnProperty.call(req.body || {}, key)) item[key] = String(req.body[key] ?? "");
@@ -2401,14 +2516,24 @@ app.patch("/api/review-items/:id", async (req, res) => {
   }
   item.updatedAt = now();
   updateSessionReviewState(store, item.sessionId);
+  const session = store.sessions.find((entry) => entry.id === item.sessionId);
+  const activeItems = store.reviewItems.filter((entry) => entry.sessionId === item.sessionId && !entry.closedReleaseId);
+  const changePackage = activeItems.length && activeItems.every((entry) => entry.humanStatus !== "待审")
+    ? upsertSessionChangePackage(store, session, store.reviewItems.filter((entry) => entry.sessionId === item.sessionId))
+    : null;
+  if (changePackage) session.status = "已生成变更包";
   await writeStore(store);
-  res.json({ item, summary: store.sessions.find((entry) => entry.id === item.sessionId)?.summary });
+  res.json({ item, summary: session?.summary, changePackage: changePackage ? presentPackage(changePackage) : null });
 });
 
 app.post("/api/review-items/merge", async (req, res) => {
   const store = await readStore();
   const ids = Array.isArray(req.body?.ids) ? req.body.ids : [];
   if (ids.length < 2) return res.status(400).json({ error: "至少选择两个讨论点。" });
+  const sessionIds = uniqueStrings(store.reviewItems.filter((entry) => ids.includes(entry.id)).map((entry) => entry.sessionId));
+  if (sessionIds.some((sessionId) => activeChangePackage(store, sessionId)?.workspaceChangeSetId)) {
+    return res.status(400).json({ error: "会议结论已经关联工作区变化，不能再合并原审阅项。" });
+  }
   const groupId = String(req.body?.groupId || makeId("group"));
   for (const item of store.reviewItems) {
     if (ids.includes(item.id)) {
@@ -2448,17 +2573,34 @@ app.post("/api/change-packages/from-session/:sessionId", async (req, res) => {
       baselineCapturedAt: baseline.createdAt
     };
   }
-  const existing = store.changePackages.find((entry) => entry.sessionId === session.id);
-  const changePackage = buildChangePackage(session, items, existing);
-  if (existing) {
-    store.changePackages = store.changePackages.map((entry) => entry.id === existing.id ? changePackage : entry);
-  } else {
-    store.changePackages.unshift(changePackage);
-  }
+  const changePackage = upsertSessionChangePackage(store, session, items);
+  if (!changePackage) return res.status(400).json({ error: "没有需要进入新版本流程的会议结论。" });
   session.status = "已生成变更包";
   session.updatedAt = now();
   await writeStore(store);
   res.json({ changePackage: presentPackage(changePackage) });
+});
+
+app.post("/api/change-packages/:id/scan-changes", async (req, res) => {
+  try {
+    const result = await meetingVersionService.scanAndLink(req.params.id, {
+      targetCheckpointId: String(req.body?.targetCheckpointId || "")
+    });
+    res.json({
+      changePackage: presentPackage(result.changePackage),
+      changeSet: result.changeSet
+    });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.get("/api/change-packages/:id/version-trace", async (req, res) => {
+  try {
+    res.json(await meetingVersionService.tracePackage(req.params.id));
+  } catch (error) {
+    res.status(404).json({ error: error.message });
+  }
 });
 
 app.post("/api/change-packages/:id/baseline", async (req, res) => {
@@ -2466,6 +2608,7 @@ app.post("/api/change-packages/:id/baseline", async (req, res) => {
     const store = await readStore();
     const changePackage = store.changePackages.find((entry) => entry.id === req.params.id);
     if (!changePackage) return res.status(404).json({ error: "变更包不存在。" });
+    if (changePackage.publishedReleaseId) return res.status(400).json({ error: "变更包已经发布，不能修改历史基线。" });
     if ((changePackage.verificationRuns || []).length && !req.body?.force) {
       return res.status(400).json({ error: "已经存在验证记录。若要更换修改前版本，请明确重置基线。" });
     }
@@ -2491,8 +2634,18 @@ app.post("/api/change-packages/:id/verify", async (req, res) => {
     const store = await readStore();
     const changePackage = store.changePackages.find((entry) => entry.id === req.params.id);
     if (!changePackage) return res.status(404).json({ error: "变更包不存在。" });
+    if (changePackage.publishedReleaseId) return res.status(400).json({ error: "变更包已经发布，不能再次验证。" });
     if (!(changePackage.decisionChecklist || []).length) {
       return res.status(400).json({ error: "变更包没有可验证的会议结论，请重新生成。" });
+    }
+    if (changePackage.workspaceChangeSetId) {
+      const result = await meetingVersionService.verifyCandidate(changePackage.id, {
+        useModel: req.body?.useModel !== false
+      });
+      return res.json({
+        run: { ...result.run, summary: verificationRunSummary(result.run) },
+        changePackage: presentPackage(result.changePackage)
+      });
     }
     const run = await createVerificationRun(store, changePackage);
     await writeStore(store);
@@ -2505,6 +2658,7 @@ app.post("/api/change-packages/:id/verify", async (req, res) => {
 app.patch("/api/change-packages/:id/verification-runs/:runId/results/:resultId", async (req, res) => {
   const store = await readStore();
   const changePackage = store.changePackages.find((entry) => entry.id === req.params.id);
+  if (changePackage?.publishedReleaseId) return res.status(400).json({ error: "正式发布后的验证记录不可修改。" });
   const run = changePackage?.verificationRuns?.find((entry) => entry.id === req.params.runId);
   const result = run?.results?.find((entry) => entry.id === req.params.resultId);
   if (!result) return res.status(404).json({ error: "验证结果不存在。" });
@@ -2519,6 +2673,7 @@ app.patch("/api/change-packages/:id/verification-runs/:runId/results/:resultId",
 app.patch("/api/change-packages/:id/decisions/:decisionId", async (req, res) => {
   const store = await readStore();
   const changePackage = store.changePackages.find((entry) => entry.id === req.params.id);
+  if (changePackage?.publishedReleaseId) return res.status(400).json({ error: "正式发布后的会议结论不可修改。" });
   const decision = changePackage?.decisionChecklist?.find((entry) => entry.id === req.params.decisionId);
   if (!decision) return res.status(404).json({ error: "会议结论不存在。" });
   if (Object.prototype.hasOwnProperty.call(req.body || {}, "expectedOutcome")) {
@@ -2533,6 +2688,7 @@ app.patch("/api/change-packages/:id", async (req, res) => {
   const store = await readStore();
   const changePackage = store.changePackages.find((entry) => entry.id === req.params.id);
   if (!changePackage) return res.status(404).json({ error: "变更包不存在。" });
+  if (changePackage.publishedReleaseId) return res.status(400).json({ error: "变更包已经发布，不能修改历史记录。" });
   for (const key of ["title", "status"]) {
     if (Object.prototype.hasOwnProperty.call(req.body || {}, key)) changePackage[key] = String(req.body[key] ?? "");
   }
@@ -2544,6 +2700,7 @@ app.patch("/api/change-packages/:id", async (req, res) => {
 app.patch("/api/change-packages/:id/work-items/:workId", async (req, res) => {
   const store = await readStore();
   const changePackage = store.changePackages.find((entry) => entry.id === req.params.id);
+  if (changePackage?.publishedReleaseId) return res.status(400).json({ error: "变更包已经发布，不能修改历史记录。" });
   const workItem = changePackage?.workItems?.find((entry) => entry.id === req.params.workId);
   if (!workItem) return res.status(404).json({ error: "落实项不存在。" });
   for (const key of ["title", "phase", "status", "deliverable", "validation", "note"]) {
@@ -2558,6 +2715,7 @@ app.patch("/api/change-packages/:id/work-items/:workId", async (req, res) => {
 app.patch("/api/change-packages/:id/document-updates/:updateId", async (req, res) => {
   const store = await readStore();
   const changePackage = store.changePackages.find((entry) => entry.id === req.params.id);
+  if (changePackage?.publishedReleaseId) return res.status(400).json({ error: "变更包已经发布，不能修改历史记录。" });
   const update = changePackage?.documentUpdates?.find((entry) => entry.id === req.params.updateId);
   if (!update) return res.status(404).json({ error: "文档同步项不存在。" });
   for (const key of ["status", "note"]) {
@@ -2571,6 +2729,10 @@ app.patch("/api/change-packages/:id/document-updates/:updateId", async (req, res
 
 app.delete("/api/change-packages/:id", async (req, res) => {
   const store = await readStore();
+  const changePackage = store.changePackages.find((entry) => entry.id === req.params.id);
+  if (changePackage?.workspaceChangeSetId || changePackage?.publishedReleaseId) {
+    return res.status(400).json({ error: "变更包已经进入版本流程，不能删除审计记录。" });
+  }
   store.changePackages = store.changePackages.filter((entry) => entry.id !== req.params.id);
   await writeStore(store);
   res.json({ ok: true });

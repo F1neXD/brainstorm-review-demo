@@ -315,6 +315,7 @@ export function validateStoreV4(store) {
     ...array(entry.candidateHistory).map((candidate) => candidate?.id)
   ]).filter(Boolean));
   const statementIds = new Set(store.canonStatements.map((entry) => entry.id));
+  const reviewItemIds = new Set(store.reviewItems.map((entry) => entry.id));
   for (const document of store.documents) {
     if (!familyIds.has(document.documentFamilyId)) throw new Error("文档引用了不存在的文档族：" + document.id);
     if (!DOCUMENT_VERSION_STATES.includes(document.versionState)) throw new Error("文档版本状态无效：" + document.id);
@@ -366,6 +367,9 @@ export function validateStoreV4(store) {
     for (const childId of array(unit.splitChildIds)) {
       if (!changeUnitIds.has(childId)) throw new Error("拆分变更单元引用了不存在的子单元：" + unit.id);
     }
+    if (unit.sourceReviewItemId && !reviewItemIds.has(unit.sourceReviewItemId)) {
+      throw new Error("变更单元引用了不存在的会议结论：" + unit.id);
+    }
   }
   for (const decision of store.adoptionDecisions) {
     if (!changeSetIds.has(decision.changeSetId)) throw new Error("采纳决定引用了不存在的变更集：" + decision.id);
@@ -409,6 +413,30 @@ export function validateStoreV4(store) {
     if (conflict.releaseId && !releaseIds.has(conflict.releaseId)) throw new Error("口径冲突引用了不存在的正式版本：" + conflict.id);
     for (const statementId of array(conflict.statementIds)) {
       if (!statementIds.has(statementId)) throw new Error("口径冲突引用了不存在的口径：" + conflict.id);
+    }
+  }
+  for (const changePackage of store.changePackages) {
+    if (changePackage.workspaceChangeSetId && !changeSetIds.has(changePackage.workspaceChangeSetId)) {
+      throw new Error("变更包引用了不存在的工作区变更集：" + changePackage.id);
+    }
+    if (changePackage.baselineReleaseId && !releaseIds.has(changePackage.baselineReleaseId)) {
+      throw new Error("变更包引用了不存在的正式基线：" + changePackage.id);
+    }
+    if (changePackage.publishedReleaseId && !releaseIds.has(changePackage.publishedReleaseId)) {
+      throw new Error("变更包引用了不存在的发布版本：" + changePackage.id);
+    }
+    for (const run of array(changePackage.verificationRuns)) {
+      if (run.changeSetId && !changeSetIds.has(run.changeSetId)) throw new Error("验证记录引用了不存在的变更集：" + run.id);
+      if (run.candidateId && !candidateIds.has(run.candidateId)) throw new Error("验证记录引用了不存在的候选版：" + run.id);
+      if (run.baselineReleaseId && !releaseIds.has(run.baselineReleaseId)) throw new Error("验证记录引用了不存在的正式基线：" + run.id);
+    }
+  }
+  for (const reviewItem of store.reviewItems) {
+    if (reviewItem.closedReleaseId && !releaseIds.has(reviewItem.closedReleaseId)) {
+      throw new Error("会议结论引用了不存在的关闭版本：" + reviewItem.id);
+    }
+    if (reviewItem.closedChangeSetId && !changeSetIds.has(reviewItem.closedChangeSetId)) {
+      throw new Error("会议结论引用了不存在的关闭变更集：" + reviewItem.id);
     }
   }
   return store;

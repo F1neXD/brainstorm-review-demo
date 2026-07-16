@@ -350,6 +350,18 @@ export class ChangeSetService {
       unit.assignmentNote = String(note || "");
       unit.assignedAt = unit.assignmentState === "未归属" ? "" : this.clock();
       unit.updatedAt = this.clock();
+      for (const changePackage of store.changePackages.filter((entry) => entry.workspaceChangeSetId === changeSet.id)) {
+        for (const decision of changePackage.decisionChecklist || []) {
+          decision.linkedChangeUnitIds = (decision.linkedChangeUnitIds || []).filter((entry) => entry !== unit.id);
+          if (reviewItemId && decision.reviewItemId === reviewItemId) {
+            decision.linkedChangeUnitIds = unique([...decision.linkedChangeUnitIds, unit.id]);
+          }
+        }
+      }
+      for (const reviewItem of store.reviewItems) {
+        reviewItem.linkedChangeUnitIds = (reviewItem.linkedChangeUnitIds || []).filter((entry) => entry !== unit.id);
+        if (reviewItem.id === reviewItemId) reviewItem.linkedChangeUnitIds = unique([...reviewItem.linkedChangeUnitIds, unit.id]);
+      }
       changeSet.unassignedUnitIds = store.changeUnits
         .filter((entry) => entry.changeSetId === changeSet.id && entry.assignmentState === "未归属")
         .map((entry) => entry.id);
