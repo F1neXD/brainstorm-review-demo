@@ -368,8 +368,39 @@ function splitIntoChunks(document, rawText) {
   return chunks;
 }
 
-async function loadKnowledgeChunks(store) {
+async function loadKnowledgeChunks(store, options = {}) {
   const chunks = [];
+  const canonicalRelease = store.canonReleases.find((entry) => entry.id === store.versioning.canonicalHeadId);
+  if (canonicalRelease) {
+    for (const file of canonicalRelease.manifest || []) {
+      const document = store.documents.find((entry) => entry.id === file.documentId)
+        || store.documents.find((entry) => entry.documentFamilyId === file.familyId);
+      if ((file.knowledgeStatus || document?.knowledgeStatus) === "忽略") continue;
+      const ext = path.extname(file.sourcePath || "").toLowerCase();
+      if (!knowledgeTypes.includes(ext)) continue;
+      const revision = store.documentRevisions.find((entry) => entry.id === file.revisionId);
+      if (!revision) throw new Error("正式基线包含无法解析的修订：" + file.revisionId);
+      const raw = (await versionWorkspace.readRevisionObject(revision)).toString("utf8");
+      const sourceDocument = {
+        ...(document || {}),
+        id: document?.id || file.familyId,
+        sourceType: "canonical",
+        fileName: file.sourcePath,
+        originalName: file.sourcePath,
+        filePath: file.sourcePath,
+        title: file.title || document?.title || path.basename(file.sourcePath).replace(/\.[^.]+$/, ""),
+        knowledgeStatus: file.knowledgeStatus || document?.knowledgeStatus || "参考"
+      };
+      chunks.push(...splitIntoChunks(sourceDocument, raw).map((chunk) => ({
+        ...chunk,
+        id: "canonical:" + canonicalRelease.id + ":" + chunk.id,
+        authority: "canonical",
+        canonicalReleaseId: canonicalRelease.id,
+        revisionId: revision.id
+      })));
+    }
+    if (!options.includeDrafts) return chunks;
+  }
   for (const document of store.documents) {
     if (document.knowledgeStatus === "忽略") continue;
     const ext = path.extname(document.fileName || document.originalName || document.filePath || "").toLowerCase();
@@ -377,7 +408,11 @@ async function loadKnowledgeChunks(store) {
     try {
       const sourcePath = document.sourceType === "folder" ? document.filePath : path.join(uploadDir, document.fileName);
       const raw = await fs.readFile(sourcePath, "utf8");
-      chunks.push(...splitIntoChunks(document, raw));
+      chunks.push(...splitIntoChunks(document, raw).map((chunk) => ({
+        ...chunk,
+        id: "workspace:" + chunk.id,
+        authority: "workspace"
+      })));
     } catch {
       // Missing source files remain visible in the knowledge list but are excluded from review.
     }
@@ -1052,8 +1087,8 @@ function buildSessionSummary(items) {
   };
 }
 
-async function analyzeMeeting(rawText, currentGoal, store) {
-  const chunks = await loadKnowledgeChunks(store);
+async function analyzeMeeting(rawText, currentGoal, store, options = {}) {
+  const chunks = await loadKnowledgeChunks(store, options);
   let usedModel = false;
   let warning = "";
   let points;
@@ -1091,7 +1126,16 @@ async function analyzeMeeting(rawText, currentGoal, store) {
     analysisByPoint.get(point.pointId),
     candidateMap.get(point.pointId) || []
   ));
-  return { items, chunks, usedModel, warning };
+  const canonicalRelease = store.canonReleases.find((entry) => entry.id === store.versioning.canonicalHeadId);
+  return {
+    items,
+    chunks,
+    usedModel,
+    warning,
+    knowledgeAuthority: canonicalRelease ? "正式版 #" + canonicalRelease.versionNumber : "未发布工作区",
+    canonicalReleaseId: canonicalRelease?.id || "",
+    includeDrafts: Boolean(options.includeDrafts)
+  };
 }
 
 function enrichItems(rawItems, session, previousItems = []) {
@@ -1823,6 +1867,53 @@ app.post("/api/versioning/watcher", async (req, res) => {
   }
 });
 
+app.get("/api/versioning/releases", async (_req, res) => {
+  try {
+    res.json({ releases: await versionWorkspace.listReleases() });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/versioning/releases/initial-preview", async (req, res) => {
+  try {
+    res.json({ preview: await versionWorkspace.previewInitialRelease(String(req.query?.checkpointId || "")) });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.post("/api/versioning/releases/initial", async (req, res) => {
+  try {
+    const release = await versionWorkspace.publishInitialRelease({
+      checkpointId: String(req.body?.checkpointId || ""),
+      expectedManifestHash: String(req.body?.expectedManifestHash || ""),
+      confirmation: String(req.body?.confirmation || "")
+    });
+    res.json({ release });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.get("/api/versioning/families", async (_req, res) => {
+  try {
+    const store = await readStore();
+    res.json({ families: store.documentFamilies, documents: store.documents });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.patch("/api/versioning/documents/:id/state", async (req, res) => {
+  try {
+    const document = await versionWorkspace.setDocumentVersionState(req.params.id, String(req.body?.versionState || ""));
+    res.json({ document });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
 app.get("/api/versioning/revisions/:id/content", async (req, res) => {
   try {
     const result = await versionWorkspace.readRevision(req.params.id);
@@ -1954,7 +2045,8 @@ app.post("/api/analyze", async (req, res) => {
       label: session.title + " · 修改前版本"
     });
     const previousItems = store.reviewItems.filter((item) => item.sessionId === session.id);
-    const result = await analyzeMeeting(rawText, session.currentGoal, store);
+    const includeDrafts = Boolean(req.body?.includeDrafts);
+    const result = await analyzeMeeting(rawText, session.currentGoal, store, { includeDrafts });
     const items = enrichItems(result.items, session, previousItems);
     store.reviewItems = store.reviewItems.filter((item) => item.sessionId !== session.id);
     store.reviewItems.unshift(...items);
@@ -1971,6 +2063,9 @@ app.post("/api/analyze", async (req, res) => {
       baselineCapturedAt: baseline.createdAt,
       usedModel: result.usedModel,
       knowledgeChunks: result.chunks.length,
+      knowledgeAuthority: result.knowledgeAuthority,
+      canonicalReleaseId: result.canonicalReleaseId,
+      includeDrafts: result.includeDrafts,
       warning: result.warning || "",
       analyzedAt: now()
     };
@@ -1982,6 +2077,9 @@ app.post("/api/analyze", async (req, res) => {
         baselineCapturedAt: baseline.createdAt,
         usedModel: result.usedModel,
         knowledgeChunks: result.chunks.length,
+        knowledgeAuthority: result.knowledgeAuthority,
+        canonicalReleaseId: result.canonicalReleaseId,
+        includeDrafts: result.includeDrafts,
         analyzedAt: session.analysisMeta.analyzedAt
       }
     ];
@@ -1993,6 +2091,9 @@ app.post("/api/analyze", async (req, res) => {
       summary: session.summary,
       usedModel: result.usedModel,
       knowledgeChunks: result.chunks.length,
+      knowledgeAuthority: result.knowledgeAuthority,
+      canonicalReleaseId: result.canonicalReleaseId,
+      includeDrafts: result.includeDrafts,
       warning: result.warning || ""
     });
   } catch (error) {

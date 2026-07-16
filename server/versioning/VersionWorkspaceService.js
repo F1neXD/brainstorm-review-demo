@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { createArchiveEngine } from "../archive/createArchiveEngine.js";
@@ -17,6 +18,25 @@ function pathKey(value) {
 
 function titleFromPath(value) {
   return path.basename(String(value || "未命名文档")).replace(/\.[^.]+$/, "") || "未命名文档";
+}
+
+function manifestHash(files) {
+  const normalized = [...files]
+    .map((entry) => ({
+      documentId: entry.documentId || "",
+      familyId: entry.familyId,
+      revisionId: entry.revisionId,
+      sourcePath: normalizedPath(entry.sourcePath),
+      contentHash: entry.contentHash,
+      size: Number(entry.size || 0),
+      title: String(entry.title || ""),
+      knowledgeStatus: String(entry.knowledgeStatus || "参考")
+    }))
+    .sort((left, right) => left.sourcePath.localeCompare(right.sourcePath, "zh-CN"));
+  return {
+    files: normalized,
+    hash: crypto.createHash("sha256").update(JSON.stringify(normalized)).digest("hex")
+  };
 }
 
 export class VersionWorkspaceService {
@@ -199,7 +219,6 @@ export class VersionWorkspaceService {
       }
       if (document) {
         document.documentFamilyId = family.id;
-        document.versionState = "工作草稿";
         family.documentIds = unique([...(family.documentIds || []), document.id]);
       }
       let revision = revisionByFamilyHash.get(family.id + ":" + file.contentHash);
@@ -227,6 +246,7 @@ export class VersionWorkspaceService {
       family.latestArchivedRevisionId = revision.id;
       family.updatedAt = capturedAt;
       if (document) document.currentRevisionId = revision.id;
+      if (document) document.versionState = family.canonicalRevisionId === revision.id ? "当前正式" : "工作草稿";
       latestFiles.push({
         documentId: document?.id || "",
         familyId: family.id,
@@ -338,6 +358,7 @@ export class VersionWorkspaceService {
 
   async getStatus() {
     const store = await this.readStore();
+    const canonicalHead = store.canonReleases.find((entry) => entry.id === store.versioning.canonicalHeadId);
     return {
       ...store.versioning,
       knowledgeFolder: store.knowledgeFolder || "",
@@ -347,8 +368,134 @@ export class VersionWorkspaceService {
         checkpoints: store.checkpoints.length,
         pendingRevisions: store.versioning.pendingCheckpoint?.capturedRevisionIds?.length || 0
       },
+      canonicalHead: canonicalHead ? {
+        id: canonicalHead.id,
+        versionNumber: canonicalHead.versionNumber,
+        title: canonicalHead.title,
+        manifestHash: canonicalHead.manifestHash,
+        fileCount: canonicalHead.fileCount,
+        publishedAt: canonicalHead.publishedAt
+      } : null,
       capabilities: this.archive?.capabilities || {}
     };
+  }
+
+  buildInitialReleasePreview(store, checkpointId) {
+    if (store.versioning.canonicalHeadId) throw new Error("已经存在正式基线，不能重复初始化。");
+    const checkpoint = store.checkpoints.find((entry) => entry.id === (checkpointId || store.versioning.lastCheckpointId));
+    if (!checkpoint) throw new Error("没有可发布的工作区检查点。");
+    const releaseFiles = (checkpoint.files || []).map((file) => {
+      const document = store.documents.find((entry) => entry.id === file.documentId)
+        || store.documents.find((entry) => entry.documentFamilyId === file.familyId);
+      const family = store.documentFamilies.find((entry) => entry.id === file.familyId);
+      return {
+        ...file,
+        title: document?.title || family?.title || titleFromPath(file.sourcePath),
+        knowledgeStatus: document?.knowledgeStatus || "参考"
+      };
+    });
+    const manifest = manifestHash(releaseFiles);
+    const revisionIds = new Set(store.documentRevisions.map((entry) => entry.id));
+    const familyCounts = new Map();
+    for (const file of manifest.files) familyCounts.set(file.familyId, (familyCounts.get(file.familyId) || 0) + 1);
+    const duplicateFamilies = [...familyCounts.entries()].filter(([, count]) => count > 1).map(([familyId]) => familyId);
+    const missingRevisionIds = manifest.files.filter((entry) => !revisionIds.has(entry.revisionId)).map((entry) => entry.revisionId);
+    const gates = [
+      { id: "checkpoint-complete", label: "检查点已完成", passed: checkpoint.status === "已完成" && Boolean(checkpoint.archiveRevision) },
+      { id: "no-pending-capture", label: "没有待收口修订", passed: !store.versioning.pendingCheckpoint },
+      { id: "manifest-not-empty", label: "正式清单不为空", passed: manifest.files.length > 0 },
+      { id: "all-revisions-present", label: "全部修订可解析", passed: missingRevisionIds.length === 0, details: missingRevisionIds },
+      { id: "single-revision-per-family", label: "每个文档族只有一个正式修订", passed: duplicateFamilies.length === 0, details: duplicateFamilies }
+    ];
+    return {
+      checkpointId: checkpoint.id,
+      checkpointLabel: checkpoint.label,
+      archiveRevision: checkpoint.archiveRevision,
+      versionNumber: 1,
+      title: "正式版 #1",
+      fileCount: manifest.files.length,
+      manifestHash: manifest.hash,
+      files: manifest.files,
+      gates,
+      ready: gates.every((entry) => entry.passed),
+      requiredConfirmation: "确认发布正式版 #1"
+    };
+  }
+
+  async previewInitialRelease(checkpointId = "") {
+    const store = await this.readStore();
+    return this.buildInitialReleasePreview(store, checkpointId);
+  }
+
+  async publishInitialRelease({ checkpointId, expectedManifestHash, confirmation }) {
+    return this.enqueue(async () => {
+      const store = await this.readStore();
+      const preview = this.buildInitialReleasePreview(store, checkpointId);
+      if (!preview.ready) throw new Error("首次正式基线未通过发布检查。");
+      if (String(confirmation || "") !== preview.requiredConfirmation) throw new Error("发布确认文字不匹配。");
+      if (String(expectedManifestHash || "") !== preview.manifestHash) throw new Error("检查点已变化，请重新预览后发布。");
+      if (!this.archive?.engine) throw new Error("版本归档当前不可用。");
+
+      const releaseId = "canon_1_" + preview.manifestHash.slice(0, 12);
+      const archiveRelease = await this.archive.engine.publish({
+        revision: preview.archiveRevision,
+        releaseId
+      });
+      const publishedAt = this.clock();
+      const release = {
+        id: releaseId,
+        versionNumber: 1,
+        title: preview.title,
+        status: "已发布",
+        checkpointId: preview.checkpointId,
+        archiveRevision: preview.archiveRevision,
+        archiveRef: archiveRelease.ref,
+        manifestHash: preview.manifestHash,
+        manifest: preview.files,
+        fileCount: preview.fileCount,
+        previousReleaseId: "",
+        publishedAt,
+        confirmedAt: publishedAt,
+        confirmation: preview.requiredConfirmation,
+        immutable: true
+      };
+      const canonicalRevisionIds = new Set(preview.files.map((entry) => entry.revisionId));
+      const canonicalByFamily = new Map(preview.files.map((entry) => [entry.familyId, entry.revisionId]));
+      for (const revision of store.documentRevisions) {
+        if (revision.versionState === "当前正式" && !canonicalRevisionIds.has(revision.id)) revision.versionState = "历史版本";
+        if (canonicalRevisionIds.has(revision.id)) revision.versionState = "当前正式";
+      }
+      for (const family of store.documentFamilies) {
+        family.canonicalRevisionId = canonicalByFamily.get(family.id) || "";
+      }
+      for (const document of store.documents) {
+        document.versionState = canonicalByFamily.has(document.documentFamilyId) ? "当前正式" : document.versionState;
+      }
+      store.canonReleases.push(release);
+      store.versioning.canonicalHeadId = release.id;
+      await this.writeStore(store);
+      return release;
+    });
+  }
+
+  async listReleases() {
+    const store = await this.readStore();
+    return [...store.canonReleases].sort((left, right) => Number(right.versionNumber) - Number(left.versionNumber));
+  }
+
+  async setDocumentVersionState(documentId, versionState) {
+    if (!["工作草稿", "历史版本", "待归类"].includes(versionState)) {
+      throw new Error("当前正式状态只能通过正式发布产生。");
+    }
+    return this.enqueue(async () => {
+      const store = await this.readStore();
+      const document = store.documents.find((entry) => entry.id === documentId);
+      if (!document) throw new Error("文档不存在。");
+      document.versionState = versionState;
+      document.versionStateManual = true;
+      await this.writeStore(store);
+      return document;
+    });
   }
 
   async listCheckpoints() {
@@ -365,18 +512,20 @@ export class VersionWorkspaceService {
     const store = await this.readStore();
     const revision = store.documentRevisions.find((entry) => entry.id === revisionId);
     if (!revision) throw new Error("修订不存在。");
-    if (revision.changeType === "deleted") return { revision, content: Buffer.alloc(0) };
+    return { revision, content: await this.readRevisionObject(revision) };
+  }
+
+  async readRevisionObject(revision) {
+    if (revision.changeType === "deleted") return Buffer.alloc(0);
     if (revision.objectLocator?.type === "legacy-snapshot") {
-      const content = await fs.readFile(path.join(this.legacySnapshotObjectRoot, revision.objectLocator.hash + ".txt"));
-      return { revision, content };
+      return fs.readFile(path.join(this.legacySnapshotObjectRoot, revision.objectLocator.hash + ".txt"));
     }
     if (revision.objectLocator?.type === "git") {
-      const content = await this.archive.engine.readFile({
+      return this.archive.engine.readFile({
         revision: revision.objectLocator.revision,
         filePath: revision.objectLocator.path,
         binary: true
       });
-      return { revision, content };
     }
     throw new Error("修订没有可读取的归档对象。");
   }

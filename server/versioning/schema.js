@@ -301,6 +301,7 @@ export function validateStoreV4(store) {
 
   const familyIds = new Set(store.documentFamilies.map((entry) => entry.id));
   const revisionIds = new Set(store.documentRevisions.map((entry) => entry.id));
+  const revisionById = new Map(store.documentRevisions.map((entry) => [entry.id, entry]));
   const checkpointIds = new Set(store.checkpoints.map((entry) => entry.id));
   const releaseIds = new Set(store.canonReleases.map((entry) => entry.id));
   for (const document of store.documents) {
@@ -312,6 +313,14 @@ export function validateStoreV4(store) {
     for (const checkpointId of unique(revision.checkpointIds)) {
       if (!checkpointIds.has(checkpointId)) throw new Error("修订引用了不存在的检查点：" + revision.id);
     }
+  }
+  for (const family of store.documentFamilies) {
+    if (family.canonicalRevisionId) {
+      const revision = revisionById.get(family.canonicalRevisionId);
+      if (!revision || revision.familyId !== family.id) throw new Error("文档族引用了无效的正式修订：" + family.id);
+    }
+    const canonicalCount = store.documentRevisions.filter((entry) => entry.familyId === family.id && entry.versionState === "当前正式").length;
+    if (canonicalCount > 1) throw new Error("同一文档族存在多个当前正式修订：" + family.id);
   }
   for (const checkpoint of store.checkpoints) {
     for (const revisionId of unique(checkpoint.revisionIds)) {
@@ -325,6 +334,13 @@ export function validateStoreV4(store) {
   }
   if (store.versioning?.canonicalHeadId && !releaseIds.has(store.versioning.canonicalHeadId)) {
     throw new Error("canonicalHeadId 引用了不存在的正式版本。");
+  }
+  for (const release of store.canonReleases) {
+    for (const file of array(release.manifest)) {
+      if (!familyIds.has(file.familyId) || !revisionIds.has(file.revisionId)) {
+        throw new Error("正式版本清单包含无效引用：" + release.id);
+      }
+    }
   }
   return store;
 }

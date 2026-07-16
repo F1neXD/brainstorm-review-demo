@@ -256,10 +256,14 @@ export class GitArchiveEngine extends ArchiveEngine {
     const id = safeId(releaseId, "releaseId");
     const ref = "refs/archive/releases/" + id;
     const existing = await this.runGit(["show-ref", "--verify", "--quiet", ref], { allowExitCodes: [1] });
-    if (existing.exitCode === 0) throw new Error("正式版本编号已存在，不能覆盖。");
+    if (existing.exitCode === 0) {
+      const existingRevision = String((await this.runGit(["rev-parse", ref])).stdout).trim();
+      if (existingRevision !== String(revision)) throw new Error("正式版本编号已存在，不能覆盖。");
+      return { id, revision: existingRevision, ref, existing: true };
+    }
     await this.runGit(["update-ref", ref, String(revision), ZERO_SHA]);
     const resolved = String((await this.runGit(["rev-parse", ref])).stdout).trim();
-    return { id, revision: resolved, ref };
+    return { id, revision: resolved, ref, existing: false };
   }
 
   async restore({ revision, restoreId }) {
