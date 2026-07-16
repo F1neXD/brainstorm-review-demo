@@ -6,7 +6,8 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import multer from "multer";
 import { fileURLToPath } from "node:url";
-import { atomicWriteJson, persistStoreMigration } from "./store/persistence.js";
+import { atomicWriteJson, persistStoreMigration, recoverAtomicJson } from "./store/persistence.js";
+import { OperationCoordinator, serializeMutationRequests } from "./store/OperationCoordinator.js";
 import { CanonReleaseService } from "./versioning/CanonReleaseService.js";
 import { ChangeSetService } from "./versioning/ChangeSetService.js";
 import { MeetingVersionService } from "./versioning/MeetingVersionService.js";
@@ -34,6 +35,7 @@ await fs.mkdir(snapshotObjectDir, { recursive: true });
 dotenv.config({ path: envPath });
 
 const app = express();
+const operationCoordinator = new OperationCoordinator();
 const port = Number(process.env.PORT || 8787);
 const settingKeys = ["OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL", "PORT"];
 const knowledgeTypes = [".md", ".txt", ".html", ".htm", ".json"];
@@ -46,6 +48,7 @@ const verificationHumanStatuses = ["待确认", "确认完成", "继续修改", 
 
 app.use(cors());
 app.use(express.json({ limit: "8mb" }));
+app.use(serializeMutationRequests(operationCoordinator));
 
 const upload = multer({
   storage: multer.diskStorage({
@@ -232,6 +235,8 @@ async function writeStore(store) {
 }
 
 async function ensureStoreMigrated() {
+  const recovery = await recoverAtomicJson(storePath);
+  if (recovery.recovered) console.log("Store recovered from an interrupted atomic write: " + recovery.recoveredFrom);
   let rawContent;
   try {
     rawContent = await fs.readFile(storePath, "utf8");
@@ -1891,7 +1896,8 @@ const versionWorkspace = new VersionWorkspaceService({
     if (store.knowledgeFolder) await scanKnowledgeFolder(store.knowledgeFolder, store);
   },
   makeId,
-  clock: now
+  clock: now,
+  operationCoordinator
 });
 
 const changeSetService = new ChangeSetService({

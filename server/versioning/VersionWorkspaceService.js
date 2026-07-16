@@ -49,7 +49,8 @@ export class VersionWorkspaceService {
     makeId,
     clock = () => new Date().toISOString(),
     watcherOptions = {},
-    gitBinary = "git"
+    gitBinary = "git",
+    operationCoordinator = null
   }) {
     this.archiveRoot = archiveRoot;
     this.legacySnapshotObjectRoot = legacySnapshotObjectRoot;
@@ -59,6 +60,7 @@ export class VersionWorkspaceService {
     this.makeId = makeId;
     this.clock = clock;
     this.gitBinary = gitBinary;
+    this.operationCoordinator = operationCoordinator;
     this.archive = null;
     this.initialized = false;
     this.operationQueue = Promise.resolve();
@@ -71,6 +73,7 @@ export class VersionWorkspaceService {
   }
 
   enqueue(operation) {
+    if (this.operationCoordinator) return this.operationCoordinator.run(operation, "版本工作区操作");
     const result = this.operationQueue.then(operation, operation);
     this.operationQueue = result.catch(() => {});
     return result;
