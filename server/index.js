@@ -8,6 +8,7 @@ import multer from "multer";
 import { fileURLToPath } from "node:url";
 import { atomicWriteJson, persistStoreMigration } from "./store/persistence.js";
 import { migrateStoreToV4 } from "./versioning/schema.js";
+import { VersionWorkspaceService } from "./versioning/VersionWorkspaceService.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -21,6 +22,7 @@ const snapshotDir = path.join(dataDir, "snapshots");
 const snapshotObjectDir = path.join(snapshotDir, "objects");
 const storePath = path.join(dataDir, "store.json");
 const migrationsDirectory = path.join(dataDir, "migrations");
+const versionArchiveRoot = path.join(dataDir, "version-archive");
 const envPath = path.join(rootDir, ".env");
 
 await fs.mkdir(uploadDir, { recursive: true });
@@ -1630,6 +1632,18 @@ function toMarkdown(session, items, changePackage) {
   return lines.join("\n");
 }
 
+const versionWorkspace = new VersionWorkspaceService({
+  archiveRoot: versionArchiveRoot,
+  legacySnapshotObjectRoot: snapshotObjectDir,
+  readStore,
+  writeStore,
+  refreshWorkspace: async (store) => {
+    if (store.knowledgeFolder) await scanKnowledgeFolder(store.knowledgeFolder, store);
+  },
+  makeId,
+  clock: now
+});
+
 app.get("/api/settings", async (_req, res) => {
   const env = await readEnvFile();
   res.json({
@@ -1673,6 +1687,7 @@ app.post("/api/knowledge/folder", async (req, res) => {
     if (!folderPath) return res.status(400).json({ error: "请填写本地知识库文件夹路径。" });
     const documents = await scanKnowledgeFolder(folderPath, store);
     await writeStore(store);
+    await versionWorkspace.configureWorkspace({ enableWatcher: true });
     res.json({ ok: true, knowledgeFolder: store.knowledgeFolder, documents });
   } catch (error) {
     res.status(400).json({ error: error.message });
@@ -1685,6 +1700,8 @@ app.post("/api/knowledge/rescan", async (_req, res) => {
     if (!store.knowledgeFolder) return res.status(400).json({ error: "还没有设置知识库文件夹。" });
     const documents = await scanKnowledgeFolder(store.knowledgeFolder, store);
     await writeStore(store);
+    await versionWorkspace.captureRevisionNow({ reason: "手动重新扫描" });
+    await versionWorkspace.finalizePendingCheckpoint({ label: "手动重新扫描", purpose: "rescan" });
     res.json({ ok: true, knowledgeFolder: store.knowledgeFolder, documents });
   } catch (error) {
     res.status(400).json({ error: error.message });
@@ -1765,6 +1782,61 @@ app.delete("/api/knowledge/:id", async (req, res) => {
   store.documents = store.documents.filter((entry) => entry.id !== req.params.id);
   await writeStore(store);
   res.json({ ok: true });
+});
+
+app.get("/api/versioning/status", async (_req, res) => {
+  try {
+    res.json(await versionWorkspace.getStatus());
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/versioning/checkpoints", async (_req, res) => {
+  try {
+    res.json({ checkpoints: await versionWorkspace.listCheckpoints() });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/versioning/checkpoints", async (req, res) => {
+  try {
+    const label = String(req.body?.label || "").trim();
+    if (!label) return res.status(400).json({ error: "请填写检查点名称。" });
+    const checkpoint = await versionWorkspace.manualCheckpoint({ label });
+    res.json({ checkpoint });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.post("/api/versioning/watcher", async (req, res) => {
+  try {
+    res.json(await versionWorkspace.setWatcherEnabled(Boolean(req.body?.enabled)));
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.get("/api/versioning/revisions/:id/content", async (req, res) => {
+  try {
+    const result = await versionWorkspace.readRevision(req.params.id);
+    const extension = path.extname(result.revision.sourcePath || "").toLowerCase();
+    res.type(knowledgeTypes.includes(extension) ? "text/plain; charset=utf-8" : "application/octet-stream");
+    res.setHeader("X-Revision-Id", result.revision.id);
+    res.send(result.content);
+  } catch (error) {
+    res.status(404).json({ error: error.message });
+  }
+});
+
+app.post("/api/versioning/checkpoints/:id/restore", async (req, res) => {
+  try {
+    res.json({ restore: await versionWorkspace.restoreCheckpoint(req.params.id) });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
 });
 
 app.get("/api/sessions", async (_req, res) => {
@@ -2143,6 +2215,7 @@ app.post("/api/export", async (req, res) => {
 });
 
 await ensureStoreMigrated();
+await versionWorkspace.initialize();
 
 const server = app.listen(port, "127.0.0.1", () => {
   const address = server.address();

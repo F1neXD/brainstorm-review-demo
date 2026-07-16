@@ -36,7 +36,13 @@ function normalizeVersioning(value) {
     lastCheckpointId: String(value?.lastCheckpointId || ""),
     canonicalHeadId: String(value?.canonicalHeadId || ""),
     watcherEnabled: Boolean(value?.watcherEnabled),
-    lastScanAt: String(value?.lastScanAt || "")
+    watcherConfigured: Boolean(value?.watcherConfigured),
+    lastScanAt: String(value?.lastScanAt || ""),
+    lastArchiveRevision: String(value?.lastArchiveRevision || ""),
+    lastError: String(value?.lastError || ""),
+    pendingCheckpoint: value?.pendingCheckpoint && typeof value.pendingCheckpoint === "object"
+      ? cloneJson(value.pendingCheckpoint)
+      : null
   };
 }
 
@@ -202,8 +208,13 @@ export function migrateStoreToV4(rawStore, options = {}) {
         contentHash: hash,
         size: Number(file.size || 0)
       });
-      family.latestArchivedRevisionId = revision.id;
-      family.updatedAt = String(snapshot.createdAt || family.updatedAt || "");
+      const latestRevision = revisionMap.get(family.latestArchivedRevisionId);
+      if (!latestRevision || String(latestRevision.createdAt || "") <= String(revision.createdAt || "")) {
+        family.latestArchivedRevisionId = revision.id;
+      }
+      if (String(family.updatedAt || "") < String(snapshot.createdAt || "")) {
+        family.updatedAt = String(snapshot.createdAt || "");
+      }
     }
     checkpoint.revisionIds = unique(checkpoint.revisionIds);
     checkpoint.fileCount = checkpoint.files.length;

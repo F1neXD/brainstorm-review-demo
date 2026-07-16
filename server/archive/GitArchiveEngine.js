@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -28,15 +29,16 @@ function normalizeRepositoryPath(value) {
   return normalized;
 }
 
-async function walkFiles(rootPath, relativePath = "", files = []) {
+async function walkFiles(rootPath, relativePath = "", files = [], options = {}) {
   const currentPath = relativePath ? path.join(rootPath, relativePath) : rootPath;
   const entries = await fs.readdir(currentPath, { withFileTypes: true });
   entries.sort((left, right) => left.name.localeCompare(right.name, "zh-CN"));
   for (const entry of entries) {
-    if (entry.name === ".git") continue;
+    if (entry.name === ".git" || options.ignoredNames?.has(entry.name)) continue;
+    if (options.ignoreTemporaryFiles && entry.name.startsWith("~$")) continue;
     const entryRelativePath = relativePath ? path.join(relativePath, entry.name) : entry.name;
     if (entry.isDirectory()) {
-      await walkFiles(rootPath, entryRelativePath, files);
+      await walkFiles(rootPath, entryRelativePath, files, options);
       continue;
     }
     if (entry.isSymbolicLink()) {
@@ -61,13 +63,14 @@ async function removeEmptyDirectories(rootPath, relativePath = "") {
 }
 
 export class GitArchiveEngine extends ArchiveEngine {
-  constructor({ archiveRoot, gitBinary = "git" }) {
+  constructor({ archiveRoot, gitBinary = "git", ignoredNames = [] }) {
     super({ archiveRoot: path.resolve(archiveRoot) });
     this.gitBinary = gitBinary;
     this.repositoryPath = path.join(this.archiveRoot, "repository");
     this.candidateRoot = path.join(this.archiveRoot, "candidates");
     this.restoreRoot = path.join(this.archiveRoot, "restores");
     this.patchRoot = path.join(this.archiveRoot, "patches");
+    this.ignoredNames = new Set([".git", "node_modules", "dist", "build", ".idea", ".vscode", ...ignoredNames]);
     this.initialized = false;
   }
 
@@ -135,7 +138,10 @@ export class GitArchiveEngine extends ArchiveEngine {
       throw new Error("归档目录与源工作区不能互相包含。");
     }
 
-    const sourceFiles = await walkFiles(resolvedWorkspace);
+    const sourceFiles = await walkFiles(resolvedWorkspace, "", [], {
+      ignoredNames: this.ignoredNames,
+      ignoreTemporaryFiles: true
+    });
     const mirrorFiles = await walkFiles(this.repositoryPath);
     const sourceSet = new Set(sourceFiles.map((filePath) => normalizeRepositoryPath(filePath)));
     for (const mirrorFile of mirrorFiles) {
@@ -146,30 +152,38 @@ export class GitArchiveEngine extends ArchiveEngine {
     }
     await removeEmptyDirectories(this.repositoryPath);
 
+    const manifest = [];
     for (const sourceFile of sourceFiles) {
       const sourcePath = path.join(resolvedWorkspace, sourceFile);
       const targetPath = path.join(this.repositoryPath, sourceFile);
+      const [content, stat] = await Promise.all([fs.readFile(sourcePath), fs.stat(sourcePath)]);
       await fs.mkdir(path.dirname(targetPath), { recursive: true });
-      await fs.copyFile(sourcePath, targetPath);
+      await fs.writeFile(targetPath, content);
+      manifest.push({
+        sourcePath: normalizeRepositoryPath(sourceFile),
+        contentHash: crypto.createHash("sha256").update(content).digest("hex"),
+        size: content.length,
+        mtime: stat.mtime.toISOString()
+      });
     }
-    return sourceFiles.map((filePath) => normalizeRepositoryPath(filePath));
+    return manifest;
   }
 
   async capture({ workspacePath, label = "自动归档" }) {
     await this.initialize();
-    const files = await this.synchronizeWorkspace(workspacePath);
+    const manifest = await this.synchronizeWorkspace(workspacePath);
     const previousRevision = await this.currentRevision();
     await this.runGit(["add", "-A", "--", "."]);
     const changed = await this.runGit(["diff", "--cached", "--quiet"], { allowExitCodes: [1] });
     if (changed.exitCode === 0 && previousRevision) {
-      return { revision: previousRevision, previousRevision, changed: false, fileCount: files.length };
+      return { revision: previousRevision, previousRevision, changed: false, fileCount: manifest.length, manifest };
     }
     const message = String(label || "自动归档").trim().slice(0, 200) || "自动归档";
     const commitArgs = ["commit", "-m", message];
     if (changed.exitCode === 0) commitArgs.push("--allow-empty");
     await this.runGit(commitArgs);
     const revision = await this.currentRevision();
-    return { revision, previousRevision, changed: revision !== previousRevision, fileCount: files.length };
+    return { revision, previousRevision, changed: revision !== previousRevision, fileCount: manifest.length, manifest };
   }
 
   async compare({ fromRevision, toRevision, includePatch = true }) {

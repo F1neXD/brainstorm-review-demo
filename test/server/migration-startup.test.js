@@ -68,14 +68,16 @@ test("完整服务启动时安全迁移 v3，旧读取 API 保持可用", async 
   });
 
   const port = await waitForServer(child);
-  const [knowledgeResponse, sessionsResponse, packagesResponse] = await Promise.all([
+  const [knowledgeResponse, sessionsResponse, packagesResponse, versioningResponse] = await Promise.all([
     fetch("http://127.0.0.1:" + port + "/api/knowledge"),
     fetch("http://127.0.0.1:" + port + "/api/sessions"),
-    fetch("http://127.0.0.1:" + port + "/api/change-packages")
+    fetch("http://127.0.0.1:" + port + "/api/change-packages"),
+    fetch("http://127.0.0.1:" + port + "/api/versioning/status")
   ]);
   assert.equal(knowledgeResponse.status, 200);
   assert.equal(sessionsResponse.status, 200);
   assert.equal(packagesResponse.status, 200);
+  assert.equal(versioningResponse.status, 200);
   assert.equal((await sessionsResponse.json()).sessions.length, 1);
   assert.equal((await packagesResponse.json()).packages.length, 1);
 
