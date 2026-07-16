@@ -7,6 +7,7 @@ import path from "node:path";
 import multer from "multer";
 import { fileURLToPath } from "node:url";
 import { atomicWriteJson, persistStoreMigration } from "./store/persistence.js";
+import { CanonReleaseService } from "./versioning/CanonReleaseService.js";
 import { ChangeSetService } from "./versioning/ChangeSetService.js";
 import { migrateStoreToV4 } from "./versioning/schema.js";
 import { VersionWorkspaceService } from "./versioning/VersionWorkspaceService.js";
@@ -97,6 +98,8 @@ function defaultStore() {
     changeSets: [],
     changeUnits: [],
     canonReleases: [],
+    canonStatements: [],
+    canonConflicts: [],
     adoptionDecisions: [],
     schemaMigrations: [],
     versioning: {
@@ -1742,6 +1745,53 @@ ${JSON.stringify(units.map((unit) => ({
   };
 }
 
+async function classifyCanonConflictsWithModel({ conflicts, statements }) {
+  const config = modelConfiguration();
+  if (!config.apiKey) return null;
+  const statementById = new Map(statements.map((entry) => [entry.id, entry]));
+  const prompt = `
+你是游戏策划正式口径审阅助手。判断给定的候选冲突是“冲突”“一致”还是“无法判断”。
+只能使用输入中的 conflictId，不得虚构来源。适用范围不明确、缺少前提或无法证明兼容时必须返回“无法判断”。
+
+返回 JSON：
+{
+  "results": [
+    {"conflictId":"canon_conflict_x","verdict":"冲突|一致|无法判断","reason":"判断依据","confidence":0.0}
+  ]
+}
+
+候选冲突：
+${JSON.stringify(conflicts.map((conflict) => ({
+  conflictId: conflict.id,
+  type: conflict.type,
+  reason: conflict.reason,
+  statements: conflict.statementIds.map((statementId) => {
+    const statement = statementById.get(statementId);
+    return statement ? {
+      statementId: statement.id,
+      sourcePath: statement.sourcePath,
+      heading: statement.heading,
+      lineStart: statement.lineStart,
+      text: statement.text
+    } : { statementId };
+  })
+})))}
+`;
+  const result = await callModelJson(prompt);
+  const validIds = new Set(conflicts.map((entry) => entry.id));
+  return {
+    model: config.model,
+    results: (Array.isArray(result?.results) ? result.results : [])
+      .filter((entry) => validIds.has(String(entry?.conflictId || "")))
+      .map((entry) => ({
+        conflictId: String(entry.conflictId),
+        verdict: ["冲突", "一致", "无法判断"].includes(entry.verdict) ? entry.verdict : "无法判断",
+        reason: String(entry.reason || "").slice(0, 500),
+        confidence: clampNumber(entry.confidence, 0, 1)
+      }))
+  };
+}
+
 const versionWorkspace = new VersionWorkspaceService({
   archiveRoot: versionArchiveRoot,
   legacySnapshotObjectRoot: snapshotObjectDir,
@@ -1760,6 +1810,14 @@ const changeSetService = new ChangeSetService({
   versionWorkspace,
   clock: now,
   semanticGrouper: groupWorkspaceChangesWithModel
+});
+
+const canonReleaseService = new CanonReleaseService({
+  readStore,
+  writeStore,
+  versionWorkspace,
+  clock: now,
+  conflictClassifier: classifyCanonConflictsWithModel
 });
 
 app.get("/api/settings", async (_req, res) => {
@@ -1966,6 +2024,14 @@ app.post("/api/versioning/releases/initial", async (req, res) => {
   }
 });
 
+app.post("/api/versioning/releases/:id/restore", async (req, res) => {
+  try {
+    res.json({ restore: await canonReleaseService.restoreRelease(req.params.id) });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
 app.get("/api/versioning/families", async (_req, res) => {
   try {
     const store = await readStore();
@@ -2081,6 +2147,42 @@ app.patch("/api/versioning/change-sets/:id/semantic-groups/:groupId/adoption", a
 app.post("/api/versioning/change-sets/:id/candidate", async (req, res) => {
   try {
     res.json(await changeSetService.buildCandidate(req.params.id));
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.post("/api/versioning/change-sets/:id/release-preview", async (req, res) => {
+  try {
+    res.json(await canonReleaseService.previewRelease(req.params.id, {
+      useModel: req.body?.useModel !== false
+    }));
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.patch("/api/versioning/canon-conflicts/:id", async (req, res) => {
+  try {
+    const conflict = await canonReleaseService.resolveConflict(req.params.id, {
+      resolutionState: String(req.body?.resolutionState || ""),
+      note: String(req.body?.note || "")
+    });
+    res.json({ conflict });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.post("/api/versioning/change-sets/:id/release", async (req, res) => {
+  try {
+    const release = await canonReleaseService.publishRelease(req.params.id, {
+      expectedPreviewHash: String(req.body?.expectedPreviewHash || ""),
+      confirmation: String(req.body?.confirmation || ""),
+      title: String(req.body?.title || ""),
+      releaseNotes: String(req.body?.releaseNotes || "")
+    });
+    res.json({ release });
   } catch (error) {
     res.status(400).json({ error: error.message });
   }

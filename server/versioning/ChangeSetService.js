@@ -57,6 +57,11 @@ export class ChangeSetService {
     this.semanticGrouper = semanticGrouper;
   }
 
+  assertMutable(changeSet) {
+    if (!changeSet) throw new Error("变更集不存在。");
+    if (changeSet.publishedReleaseId) throw new Error("变更集已经发布，审阅决定不可再修改。");
+  }
+
   async createWorkspaceChangeSet({ targetCheckpointId = "", force = false } = {}) {
     const initialStore = await this.readStore();
     if (!initialStore.canonReleases.some((entry) => entry.id === initialStore.versioning.canonicalHeadId)) {
@@ -267,7 +272,7 @@ export class ChangeSetService {
     return this.versionWorkspace.enqueue(async () => {
       const store = await this.readStore();
       const changeSet = store.changeSets.find((entry) => entry.id === changeSetId);
-      if (!changeSet) throw new Error("变更集不存在。");
+      this.assertMutable(changeSet);
       const units = store.changeUnits.filter((entry) => entry.changeSetId === changeSetId);
       if (!this.semanticGrouper) throw new Error("大模型未配置，原始差异仍可继续审阅。");
       const groups = [];
@@ -337,13 +342,14 @@ export class ChangeSetService {
       const store = await this.readStore();
       const unit = store.changeUnits.find((entry) => entry.id === unitId);
       if (!unit) throw new Error("差异块不存在。");
+      const changeSet = store.changeSets.find((entry) => entry.id === unit.changeSetId);
+      this.assertMutable(changeSet);
       if (reviewItemId && !store.reviewItems.some((entry) => entry.id === reviewItemId)) throw new Error("会议结论不存在。");
       unit.sourceReviewItemId = String(reviewItemId || "");
       unit.assignmentState = unrelated ? "无关变化" : reviewItemId ? "已关联会议" : unit.semanticGroupId ? "已归组" : "未归属";
       unit.assignmentNote = String(note || "");
       unit.assignedAt = unit.assignmentState === "未归属" ? "" : this.clock();
       unit.updatedAt = this.clock();
-      const changeSet = store.changeSets.find((entry) => entry.id === unit.changeSetId);
       changeSet.unassignedUnitIds = store.changeUnits
         .filter((entry) => entry.changeSetId === changeSet.id && entry.assignmentState === "未归属")
         .map((entry) => entry.id);
@@ -394,6 +400,7 @@ export class ChangeSetService {
   }
 
   applyAdoptionDecision(store, changeSet, unit, adoptionState, note) {
+    this.assertMutable(changeSet);
     const allowed = ["待审阅", "纳入本版", "暂时搁置", "不纳入"];
     if (!allowed.includes(adoptionState)) throw new Error("采纳状态无效。");
     if (unit.adoptionState === "拆分后处理") throw new Error("该差异块已经拆分，请处理子差异块。");
@@ -411,6 +418,7 @@ export class ChangeSetService {
       const store = await this.readStore();
       const unit = store.changeUnits.find((entry) => entry.id === unitId);
       if (!unit) throw new Error("差异块不存在。");
+      this.assertMutable(store.changeSets.find((entry) => entry.id === unit.changeSetId));
       const changeSet = store.changeSets.find((entry) => entry.id === unit.changeSetId);
       const decision = this.applyAdoptionDecision(store, changeSet, unit, adoptionState, note);
       this.refreshDecisionState(store, changeSet);
@@ -423,7 +431,7 @@ export class ChangeSetService {
     return this.versionWorkspace.enqueue(async () => {
       const store = await this.readStore();
       const changeSet = store.changeSets.find((entry) => entry.id === changeSetId);
-      if (!changeSet) throw new Error("变更集不存在。");
+      this.assertMutable(changeSet);
       const fileUnits = this.leafUnits(store.changeUnits.filter((entry) => (
         entry.changeSetId === changeSetId && entry.fileChangeId === fileChangeId
       )));
@@ -455,6 +463,7 @@ export class ChangeSetService {
       const store = await this.readStore();
       const unit = store.changeUnits.find((entry) => entry.id === unitId);
       if (!unit) throw new Error("差异块不存在。");
+      this.assertMutable(store.changeSets.find((entry) => entry.id === unit.changeSetId));
       if (unit.unitType !== "text-hunk") throw new Error("只有文本差异块可以继续拆分。");
       if (unit.adoptionState === "拆分后处理") {
         const existingChildren = store.changeUnits.filter((entry) => entry.parentUnitId === unit.id);
@@ -524,7 +533,7 @@ export class ChangeSetService {
     return this.versionWorkspace.enqueue(async () => {
       const store = await this.readStore();
       const changeSet = store.changeSets.find((entry) => entry.id === changeSetId);
-      if (!changeSet) throw new Error("变更集不存在。");
+      this.assertMutable(changeSet);
       const release = store.canonReleases.find((entry) => entry.id === changeSet.baselineReleaseId);
       const targetCheckpoint = store.checkpoints.find((entry) => entry.id === changeSet.targetCheckpointId);
       if (!release || !targetCheckpoint) throw new Error("变更集缺少基线或目标检查点。");

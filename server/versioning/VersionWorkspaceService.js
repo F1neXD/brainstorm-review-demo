@@ -498,6 +498,11 @@ export class VersionWorkspaceService {
     return this.archive.engine.createCandidate(options);
   }
 
+  async publishArchiveRevision(options) {
+    if (!this.archive?.engine) throw new Error("版本归档当前不可用。");
+    return this.archive.engine.publish(options);
+  }
+
   async getArchiveManifest(revision) {
     if (!this.archive?.engine) throw new Error("版本归档当前不可用。");
     return this.archive.engine.manifestAtRevision(revision);

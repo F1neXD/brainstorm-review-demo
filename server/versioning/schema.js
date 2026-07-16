@@ -86,6 +86,8 @@ export function migrateStoreToV4(rawStore, options = {}) {
   store.changeSets = array(store.changeSets);
   store.changeUnits = array(store.changeUnits);
   store.canonReleases = array(store.canonReleases);
+  store.canonStatements = array(store.canonStatements);
+  store.canonConflicts = array(store.canonConflicts);
   store.adoptionDecisions = array(store.adoptionDecisions);
   store.schemaMigrations = array(store.schemaMigrations);
   store.versioning = normalizeVersioning(store.versioning);
@@ -287,7 +289,7 @@ export function validateStoreV4(store) {
   for (const key of [
     "documents", "sessions", "reviewItems", "tasks", "changePackages", "knowledgeSnapshots",
     "documentFamilies", "documentRevisions", "checkpoints", "changeSets", "changeUnits",
-    "canonReleases", "adoptionDecisions", "schemaMigrations"
+    "canonReleases", "canonStatements", "canonConflicts", "adoptionDecisions", "schemaMigrations"
   ]) {
     if (!Array.isArray(store[key])) throw new Error(key + " 必须是数组。");
   }
@@ -297,6 +299,8 @@ export function validateStoreV4(store) {
   assertUniqueIds(store.changeSets, "changeSets");
   assertUniqueIds(store.changeUnits, "changeUnits");
   assertUniqueIds(store.canonReleases, "canonReleases");
+  assertUniqueIds(store.canonStatements, "canonStatements");
+  assertUniqueIds(store.canonConflicts, "canonConflicts");
   assertUniqueIds(store.adoptionDecisions, "adoptionDecisions");
 
   const familyIds = new Set(store.documentFamilies.map((entry) => entry.id));
@@ -305,6 +309,12 @@ export function validateStoreV4(store) {
   const checkpointIds = new Set(store.checkpoints.map((entry) => entry.id));
   const changeSetIds = new Set(store.changeSets.map((entry) => entry.id));
   const releaseIds = new Set(store.canonReleases.map((entry) => entry.id));
+  const changeUnitIds = new Set(store.changeUnits.map((entry) => entry.id));
+  const candidateIds = new Set(store.changeSets.flatMap((entry) => [
+    entry.candidate?.id,
+    ...array(entry.candidateHistory).map((candidate) => candidate?.id)
+  ]).filter(Boolean));
+  const statementIds = new Set(store.canonStatements.map((entry) => entry.id));
   for (const document of store.documents) {
     if (!familyIds.has(document.documentFamilyId)) throw new Error("文档引用了不存在的文档族：" + document.id);
     if (!DOCUMENT_VERSION_STATES.includes(document.versionState)) throw new Error("文档版本状态无效：" + document.id);
@@ -335,21 +345,70 @@ export function validateStoreV4(store) {
     if (changeSet.targetCheckpointId && !checkpointIds.has(changeSet.targetCheckpointId)) {
       throw new Error("变更集引用了不存在的目标检查点：" + changeSet.id);
     }
+    if (changeSet.candidate?.checkpointId && !checkpointIds.has(changeSet.candidate.checkpointId)) {
+      throw new Error("候选版本引用了不存在的检查点：" + changeSet.id);
+    }
+    for (const unitId of [
+      ...array(changeSet.candidate?.acceptedUnitIds),
+      ...array(changeSet.candidate?.deferredUnitIds),
+      ...array(changeSet.candidate?.rejectedUnitIds)
+    ]) {
+      if (!changeUnitIds.has(unitId)) throw new Error("候选版本引用了不存在的变更单元：" + changeSet.id);
+    }
   }
   for (const unit of store.changeUnits) {
     if (!changeSetIds.has(unit.changeSetId)) throw new Error("变更单元引用了不存在的变更集：" + unit.id);
     if (unit.familyId && !familyIds.has(unit.familyId)) throw new Error("变更单元引用了不存在的文档族：" + unit.id);
     if (unit.beforeRevisionId && !revisionIds.has(unit.beforeRevisionId)) throw new Error("变更单元的修改前修订无效：" + unit.id);
     if (unit.afterRevisionId && !revisionIds.has(unit.afterRevisionId)) throw new Error("变更单元的修改后修订无效：" + unit.id);
+    if (unit.adoptionState && !ADOPTION_STATES.includes(unit.adoptionState)) throw new Error("变更单元的采纳状态无效：" + unit.id);
+    if (unit.parentUnitId && !changeUnitIds.has(unit.parentUnitId)) throw new Error("拆分变更单元引用了不存在的父单元：" + unit.id);
+    for (const childId of array(unit.splitChildIds)) {
+      if (!changeUnitIds.has(childId)) throw new Error("拆分变更单元引用了不存在的子单元：" + unit.id);
+    }
+  }
+  for (const decision of store.adoptionDecisions) {
+    if (!changeSetIds.has(decision.changeSetId)) throw new Error("采纳决定引用了不存在的变更集：" + decision.id);
+    if (!changeUnitIds.has(decision.changeUnitId)) throw new Error("采纳决定引用了不存在的变更单元：" + decision.id);
+    if (decision.decision && !ADOPTION_STATES.includes(decision.decision)) throw new Error("采纳决定状态无效：" + decision.id);
   }
   if (store.versioning?.canonicalHeadId && !releaseIds.has(store.versioning.canonicalHeadId)) {
     throw new Error("canonicalHeadId 引用了不存在的正式版本。");
   }
   for (const release of store.canonReleases) {
+    if (release.checkpointId && !checkpointIds.has(release.checkpointId)) {
+      throw new Error("正式版本引用了不存在的检查点：" + release.id);
+    }
+    if (release.previousReleaseId && !releaseIds.has(release.previousReleaseId)) {
+      throw new Error("正式版本引用了不存在的上一个版本：" + release.id);
+    }
+    const manifestFamilies = new Set();
     for (const file of array(release.manifest)) {
       if (!familyIds.has(file.familyId) || !revisionIds.has(file.revisionId)) {
         throw new Error("正式版本清单包含无效引用：" + release.id);
       }
+      if (revisionById.get(file.revisionId)?.familyId !== file.familyId) {
+        throw new Error("正式版本清单中的修订不属于对应文档族：" + release.id);
+      }
+      if (manifestFamilies.has(file.familyId)) throw new Error("正式版本清单包含重复文档族：" + release.id);
+      manifestFamilies.add(file.familyId);
+    }
+  }
+  for (const statement of store.canonStatements) {
+    if (statement.familyId && !familyIds.has(statement.familyId)) throw new Error("口径引用了不存在的文档族：" + statement.id);
+    if (statement.revisionId && !revisionIds.has(statement.revisionId)) throw new Error("口径引用了不存在的修订：" + statement.id);
+    if (statement.releaseId && !releaseIds.has(statement.releaseId)) throw new Error("口径引用了不存在的正式版本：" + statement.id);
+    if (statement.candidateId && !candidateIds.has(statement.candidateId)) throw new Error("口径引用了不存在的候选版本：" + statement.id);
+    for (const relatedId of array(statement.relatedStatementIds)) {
+      if (!statementIds.has(relatedId)) throw new Error("口径关系引用了不存在的口径：" + statement.id);
+    }
+  }
+  for (const conflict of store.canonConflicts) {
+    if (conflict.changeSetId && !changeSetIds.has(conflict.changeSetId)) throw new Error("口径冲突引用了不存在的变更集：" + conflict.id);
+    if (conflict.candidateId && !candidateIds.has(conflict.candidateId)) throw new Error("口径冲突引用了不存在的候选版本：" + conflict.id);
+    if (conflict.releaseId && !releaseIds.has(conflict.releaseId)) throw new Error("口径冲突引用了不存在的正式版本：" + conflict.id);
+    for (const statementId of array(conflict.statementIds)) {
+      if (!statementIds.has(statementId)) throw new Error("口径冲突引用了不存在的口径：" + conflict.id);
     }
   }
   return store;
