@@ -1328,6 +1328,129 @@ select:focus-visible {
   background: #f8e9b6;
 }
 
+.attachment-evidence {
+  margin-top: 16px;
+}
+
+.attachment-evidence-bar {
+  min-height: 36px;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.attachment-evidence-bar > span:not(.badge) {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.attachment-evidence-bar a {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-left: auto;
+  color: var(--primary);
+  font-weight: 700;
+  text-decoration: none;
+}
+
+.image-evidence-stage {
+  position: relative;
+  display: grid;
+  place-items: center;
+  min-height: 220px;
+  max-height: 520px;
+  margin-top: 8px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: #eef1f5;
+}
+
+.image-evidence-stage img {
+  display: block;
+  width: 100%;
+  height: auto;
+  object-fit: contain;
+}
+
+.image-evidence-stage > span {
+  position: absolute;
+  border: 2px solid #e74b3c;
+  background: rgba(231, 75, 60, 0.12);
+  box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.78);
+  pointer-events: none;
+}
+
+.pdf-evidence-frame {
+  width: 100%;
+  height: min(62vh, 620px);
+  margin-top: 8px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: #eef1f5;
+}
+
+.attachment-segments {
+  margin-top: 10px;
+  border-top: 1px solid var(--line);
+}
+
+.attachment-segments article {
+  padding: 12px 4px;
+  border-bottom: 1px solid var(--line);
+}
+
+.attachment-segments article.selected {
+  padding-right: 10px;
+  padding-left: 10px;
+  border-left: 3px solid var(--primary);
+  background: var(--primary-soft);
+}
+
+.attachment-segments article > div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.attachment-segments article strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+}
+
+.attachment-segments article span {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.attachment-segments pre {
+  margin-top: 7px;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+  color: #39475a;
+  font-family: Consolas, "Microsoft YaHei", monospace;
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.attachment-empty {
+  min-height: 120px;
+  display: grid;
+  place-items: center;
+  align-content: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
 .knowledge-source-bar,
 .compact-drop-zone,
 .knowledge-index,
@@ -2599,10 +2722,6 @@ select:focus-visible {
   grid-template-columns: 1fr 1fr;
   gap: 14px;
   margin-top: 18px;
-}
-
-.settings-grid > .soft-field:last-child {
-  grid-column: 1 / -1;
 }
 
 .export-dock {

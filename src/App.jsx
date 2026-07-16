@@ -12,6 +12,7 @@ import {
   CircleHelp,
   ClipboardCheck,
   Download,
+  ExternalLink,
   FileSearch,
   FileDiff,
   FilePlus2,
@@ -127,6 +128,14 @@ function verificationTone(status) {
   return "muted";
 }
 
+function evidenceLocationLabel(source) {
+  if (source.pageNumber) return "第 " + source.pageNumber + " 页";
+  if (source.sheetName) return source.sheetName + (source.cellRange ? " · " + source.cellRange : "");
+  if (source.region) return source.heading || "图片区域";
+  if (source.lineStart) return "行 " + source.lineStart + "-" + (source.lineEnd || source.lineStart);
+  return source.mediaType ? "附件" : "位置待确认";
+}
+
 function summarizeItems(items) {
   const documents = new Map();
   const systems = new Set();
@@ -153,7 +162,7 @@ function summarizeItems(items) {
 
 function App() {
   const [activeTab, setActiveTab] = useState("review");
-  const [settings, setSettings] = useState({ OPENAI_API_KEY: "", OPENAI_BASE_URL: "", OPENAI_MODEL: "", PORT: "8787", configured: false });
+  const [settings, setSettings] = useState({ OPENAI_API_KEY: "", OPENAI_BASE_URL: "", OPENAI_MODEL: "", OPENAI_VISION_MODEL: "", PORT: "8787", configured: false });
   const [documents, setDocuments] = useState([]);
   const [knowledgeCounts, setKnowledgeCounts] = useState({ total: 0, core: 0, reference: 0, ignored: 0 });
   const [knowledgeFolder, setKnowledgeFolder] = useState("");
@@ -531,9 +540,15 @@ function App() {
     setEvidenceContext(null);
     setEvidenceLoading(true);
     try {
-      const data = await request(
-        "/api/knowledge/" + source.documentId + "/content?start=" + (source.lineStart || 1) + "&end=" + (source.lineEnd || source.lineStart || 1)
-      );
+      const params = new URLSearchParams({
+        start: String(source.lineStart || 1),
+        end: String(source.lineEnd || source.lineStart || 1)
+      });
+      if (source.revisionId) params.set("revisionId", source.revisionId);
+      if (source.segmentId) params.set("segmentId", source.segmentId);
+      if (source.pageNumber) params.set("page", String(source.pageNumber));
+      if (source.sheetName) params.set("sheet", source.sheetName);
+      const data = await request("/api/knowledge/" + source.documentId + "/content?" + params.toString());
       setEvidenceContext(data);
     } catch (caught) {
       setError(caught.message);
@@ -1080,7 +1095,7 @@ function ReviewItem({ item, itemById, updateReviewItem, openEvidence }) {
             {evidence.map((source) => (
               <button key={source.chunkId || source.source + source.heading} onClick={() => source.documentId && openEvidence(source)}>
                 <div>
-                  <span>{source.knowledgeStatus || "参考"} · 行 {source.lineStart || "?"}-{source.lineEnd || "?"}</span>
+                  <span>{source.knowledgeStatus || "参考"} · {evidenceLocationLabel(source)}</span>
                   <strong>{source.sourcePath || source.source} / {source.heading}</strong>
                   {source.reason && <p>{source.reason}</p>}
                 </div>
@@ -1156,6 +1171,13 @@ function ReviewDecision({ status, onChange }) {
 }
 
 function EvidenceDrawer({ source, context, loading, close }) {
+  const originalHref = context?.originalUrl ? apiBase + context.originalUrl : "";
+  const selectedSegment = context?.segments?.find((entry) => entry.id === context.selectedSegmentId)
+    || context?.segments?.find((entry) => entry.id === source.segmentId)
+    || null;
+  const region = selectedSegment?.region || source.region;
+  const isImage = context?.mediaType?.startsWith("image/");
+  const isPdf = context?.mediaType === "application/pdf";
   return (
     <div className="drawer-backdrop" onMouseDown={(event) => {
       if (event.target === event.currentTarget) close();
@@ -1182,9 +1204,9 @@ function EvidenceDrawer({ source, context, loading, close }) {
         )}
 
         {loading && <div className="drawer-loading"><Loader2 className="spin" size={22} /> 正在读取</div>}
-        {!loading && context && (
+        {!loading && context?.mode === "text" && (
           <div className="source-code">
-            {context.lines.map((line) => {
+            {(context.lines || []).map((line) => {
               const highlighted = line.number >= context.start && line.number <= context.end;
               return (
                 <div className={highlighted ? "highlighted" : ""} key={line.number}>
@@ -1193,6 +1215,41 @@ function EvidenceDrawer({ source, context, loading, close }) {
                 </div>
               );
             })}
+          </div>
+        )}
+        {!loading && context?.mode === "attachment" && (
+          <div className="attachment-evidence">
+            <div className="attachment-evidence-bar">
+              <Badge tone={context.extractionStatus === "已提取" ? "success" : "warn"}>{context.extractionStatus}</Badge>
+              <span>{evidenceLocationLabel(selectedSegment || source)}</span>
+              {originalHref && <a href={originalHref} target="_blank" rel="noreferrer"><ExternalLink size={15} /> 原件</a>}
+            </div>
+
+            {isImage && originalHref && (
+              <div className="image-evidence-stage">
+                <img src={originalHref} alt={context.source} />
+                {region && <span style={{
+                  left: region.x * 100 + "%",
+                  top: region.y * 100 + "%",
+                  width: region.width * 100 + "%",
+                  height: region.height * 100 + "%"
+                }} />}
+              </div>
+            )}
+
+            {isPdf && originalHref && (
+              <iframe className="pdf-evidence-frame" src={originalHref + "#page=" + (source.pageNumber || 1)} title={context.source} />
+            )}
+
+            <div className="attachment-segments">
+              {(context.segments || []).map((segment) => (
+                <article className={segment.id === context.selectedSegmentId ? "selected" : ""} key={segment.id}>
+                  <div><strong>{segment.heading}</strong><span>{evidenceLocationLabel(segment)}</span></div>
+                  <pre>{segment.text}</pre>
+                </article>
+              ))}
+              {!context.segments?.length && <div className="attachment-empty"><CircleAlert size={18} /><span>{context.extractionError || context.extractionStatus}</span></div>}
+            </div>
           </div>
         )}
       </aside>
@@ -1262,7 +1319,7 @@ function KnowledgeWorkspace(props) {
         <span>临时添加文件</span>
         <label className="quiet-action">
           <Plus size={15} /> 选择
-          <input type="file" multiple accept=".md,.txt,.html,.htm,.json" onChange={(event) => uploadFileList(event.target.files)} />
+          <input type="file" multiple accept=".md,.txt,.html,.htm,.json,.pdf,.doc,.docx,.xls,.xlsx,.png,.jpg,.jpeg,.webp,.gif,.bmp" onChange={(event) => uploadFileList(event.target.files)} />
         </label>
       </section>
 
@@ -1324,7 +1381,7 @@ function DocumentRow({ document, onSave, onDelete }) {
         <FileText size={18} />
         <div>
           <strong>{document.title}</strong>
-          <span>{document.originalName}</span>
+          <span>{document.originalName}{document.extraction?.status ? " · " + document.extraction.status : ""}</span>
         </div>
         <Badge tone={document.knowledgeStatus === "核心" ? "accent" : document.knowledgeStatus === "忽略" ? "muted" : "neutral"}>
           {document.knowledgeStatus}
@@ -1809,7 +1866,7 @@ function VerificationEvidence({ title, evidence }) {
       {evidence.map((source) => (
         <article key={source.chunkId}>
           <strong>{source.sourcePath}</strong>
-          <span>{source.heading} · 行 {source.lineStart}-{source.lineEnd}</span>
+          <span>{source.heading} · {evidenceLocationLabel(source)}</span>
           <pre>{source.excerpt}</pre>
           {source.reason && <p>{source.reason}</p>}
         </article>
@@ -1923,6 +1980,7 @@ function SettingsWorkspace({ settings, setSettings, saveSettings, testSettings, 
         <SoftField label="API 密钥" type="password" value={settings.OPENAI_API_KEY} placeholder="留空使用本地预览" onChange={(OPENAI_API_KEY) => setSettings((current) => ({ ...current, OPENAI_API_KEY }))} />
         <SoftField label="接口地址" value={settings.OPENAI_BASE_URL} placeholder="https://api.openai.com/v1" onChange={(OPENAI_BASE_URL) => setSettings((current) => ({ ...current, OPENAI_BASE_URL }))} />
         <SoftField label="模型" value={settings.OPENAI_MODEL} placeholder="模型名称" onChange={(OPENAI_MODEL) => setSettings((current) => ({ ...current, OPENAI_MODEL }))} />
+        <SoftField label="视觉模型" value={settings.OPENAI_VISION_MODEL} placeholder="可留空" onChange={(OPENAI_VISION_MODEL) => setSettings((current) => ({ ...current, OPENAI_VISION_MODEL }))} />
       </div>
     </section>
   );

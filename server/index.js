@@ -6,6 +6,13 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import multer from "multer";
 import { fileURLToPath } from "node:url";
+import {
+  ATTACHMENT_EXTENSIONS,
+  DocumentExtractionService,
+  SUPPORTED_KNOWLEDGE_EXTENSIONS,
+  TEXT_KNOWLEDGE_EXTENSIONS,
+  mediaTypeForName
+} from "./knowledge/DocumentExtractionService.js";
 import { atomicWriteJson, persistStoreMigration, recoverAtomicJson } from "./store/persistence.js";
 import { OperationCoordinator, serializeMutationRequests } from "./store/OperationCoordinator.js";
 import { CanonReleaseService } from "./versioning/CanonReleaseService.js";
@@ -24,6 +31,7 @@ const uploadDir = path.join(dataDir, "uploads");
 const outputDir = path.join(dataDir, "outputs");
 const snapshotDir = path.join(dataDir, "snapshots");
 const snapshotObjectDir = path.join(snapshotDir, "objects");
+const extractedIndexDir = path.join(dataDir, "extracted-indexes");
 const storePath = path.join(dataDir, "store.json");
 const migrationsDirectory = path.join(dataDir, "migrations");
 const versionArchiveRoot = path.join(dataDir, "version-archive");
@@ -37,8 +45,10 @@ dotenv.config({ path: envPath });
 const app = express();
 const operationCoordinator = new OperationCoordinator();
 const port = Number(process.env.PORT || 8787);
-const settingKeys = ["OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL", "PORT"];
-const knowledgeTypes = [".md", ".txt", ".html", ".htm", ".json"];
+const settingKeys = ["OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL", "OPENAI_VISION_MODEL", "PORT"];
+const knowledgeTypes = TEXT_KNOWLEDGE_EXTENSIONS;
+const attachmentTypes = ATTACHMENT_EXTENSIONS;
+const supportedKnowledgeTypes = SUPPORTED_KNOWLEDGE_EXTENSIONS;
 const ignoredDirectories = new Set(["node_modules", ".git", "dist", "build", ".idea", ".vscode"]);
 const reviewStatuses = ["待审", "纳入变更", "需澄清", "暂不纳入"];
 const pointTypes = ["决策", "提案", "问题", "行动", "风险", "信息"];
@@ -60,7 +70,7 @@ const upload = multer({
       cb(null, Date.now() + "-" + safeName);
     }
   }),
-  limits: { fileSize: 8 * 1024 * 1024 }
+  limits: { fileSize: 64 * 1024 * 1024 }
 });
 
 function now() {
@@ -387,10 +397,10 @@ async function loadKnowledgeChunks(store, options = {}) {
         || store.documents.find((entry) => entry.documentFamilyId === file.familyId);
       if ((file.knowledgeStatus || document?.knowledgeStatus) === "忽略") continue;
       const ext = path.extname(file.sourcePath || "").toLowerCase();
-      if (!knowledgeTypes.includes(ext)) continue;
+      if (!supportedKnowledgeTypes.includes(ext)) continue;
       const revision = store.documentRevisions.find((entry) => entry.id === file.revisionId);
       if (!revision) throw new Error("正式基线包含无法解析的修订：" + file.revisionId);
-      const raw = (await versionWorkspace.readRevisionObject(revision)).toString("utf8");
+      const content = await versionWorkspace.readRevisionObject(revision);
       const sourceDocument = {
         ...(document || {}),
         id: document?.id || file.familyId,
@@ -401,7 +411,14 @@ async function loadKnowledgeChunks(store, options = {}) {
         title: file.title || document?.title || path.basename(file.sourcePath).replace(/\.[^.]+$/, ""),
         knowledgeStatus: file.knowledgeStatus || document?.knowledgeStatus || "参考"
       };
-      chunks.push(...splitIntoChunks(sourceDocument, raw).map((chunk) => ({
+      const sourceChunks = knowledgeTypes.includes(ext)
+        ? splitIntoChunks(sourceDocument, content.toString("utf8"))
+        : documentExtraction.toKnowledgeChunks(sourceDocument, await documentExtraction.extractBuffer({
+          content,
+          sourceName: file.sourcePath,
+          contentHash: file.contentHash
+        }));
+      chunks.push(...sourceChunks.map((chunk) => ({
         ...chunk,
         id: "canonical:" + canonicalRelease.id + ":" + chunk.id,
         authority: "canonical",
@@ -414,11 +431,21 @@ async function loadKnowledgeChunks(store, options = {}) {
   for (const document of store.documents) {
     if (document.knowledgeStatus === "忽略") continue;
     const ext = path.extname(document.fileName || document.originalName || document.filePath || "").toLowerCase();
-    if (!knowledgeTypes.includes(ext)) continue;
+    if (!supportedKnowledgeTypes.includes(ext)) continue;
     try {
       const sourcePath = document.sourceType === "folder" ? document.filePath : path.join(uploadDir, document.fileName);
-      const raw = await fs.readFile(sourcePath, "utf8");
-      chunks.push(...splitIntoChunks(document, raw).map((chunk) => ({
+      let sourceChunks;
+      if (knowledgeTypes.includes(ext)) {
+        sourceChunks = splitIntoChunks(document, await fs.readFile(sourcePath, "utf8"));
+      } else {
+        const cached = await documentExtraction.readIndex(document.extraction?.contentHash);
+        const index = cached || await documentExtraction.extractFile({
+          sourcePath,
+          sourceName: document.originalName || document.fileName
+        });
+        sourceChunks = documentExtraction.toKnowledgeChunks({ ...document, filePath: sourcePath }, index);
+      }
+      chunks.push(...sourceChunks.map((chunk) => ({
         ...chunk,
         id: "workspace:" + chunk.id,
         authority: "workspace"
@@ -440,8 +467,9 @@ async function walkKnowledgeFolder(folderPath, rootPath = folderPath, results = 
       continue;
     }
     if (!entry.isFile()) continue;
+    if (entry.name.startsWith("~$")) continue;
     const ext = path.extname(entry.name).toLowerCase();
-    if (!knowledgeTypes.includes(ext)) continue;
+    if (!supportedKnowledgeTypes.includes(ext)) continue;
     const stat = await fs.stat(fullPath);
     results.push({
       fullPath,
@@ -465,9 +493,32 @@ async function scanKnowledgeFolder(folderPath, store) {
       .map((document) => [path.resolve(document.filePath), document])
   );
   const scanned = await walkKnowledgeFolder(resolved);
-  const folderDocs = scanned.map((file) => {
+  const folderDocs = [];
+  for (const file of scanned) {
     const existing = oldFolderDocs.get(path.resolve(file.fullPath));
-    return {
+    const extension = path.extname(file.relativePath).toLowerCase();
+    let extraction = knowledgeTypes.includes(extension) ? null : existing?.extraction || null;
+    if (attachmentTypes.includes(extension)) {
+      try {
+        const index = await documentExtraction.extractFile({
+          sourcePath: file.fullPath,
+          sourceName: file.relativePath
+        });
+        extraction = documentExtraction.summary(index);
+      } catch (error) {
+        extraction = {
+          status: "提取失败",
+          contentHash: "",
+          mediaType: mediaTypeForName(file.relativePath),
+          segmentCount: 0,
+          textLength: 0,
+          indexedAt: now(),
+          extractorVersion: "",
+          error: String(error.message || error).slice(0, 500)
+        };
+      }
+    }
+    folderDocs.push({
       id: existing?.id || makeId("doc"),
       sourceType: "folder",
       filePath: file.fullPath,
@@ -482,11 +533,13 @@ async function scanKnowledgeFolder(folderPath, store) {
       versionState: existing?.versionState || "工作草稿",
       versionStateManual: Boolean(existing?.versionStateManual),
       currentRevisionId: existing?.currentRevisionId || "",
+      mediaType: mediaTypeForName(file.relativePath),
+      extraction,
       size: file.size,
       uploadedAt: existing?.uploadedAt || now(),
       updatedAt: file.updatedAt
-    };
-  });
+    });
+  }
 
   store.knowledgeFolder = resolved;
   store.documents = [
@@ -500,6 +553,39 @@ function documentSourcePath(document) {
   return document.sourceType === "folder"
     ? document.filePath
     : path.join(uploadDir, document.fileName);
+}
+
+function relativePathKey(value) {
+  return String(value || "").replace(/\\/g, "/").replace(/^\.\//, "").toLowerCase();
+}
+
+function revisionMatchesDocument(revision, document) {
+  if (!revision || !document) return false;
+  if (revision.documentId && revision.documentId === document.id) return true;
+  if (revision.familyId && document.documentFamilyId && revision.familyId === document.documentFamilyId) return true;
+  return relativePathKey(revision.sourcePath) === relativePathKey(document.fileName || document.originalName);
+}
+
+async function readDocumentBinary(store, document, revisionId = "") {
+  if (revisionId) {
+    const revision = store.documentRevisions.find((entry) => entry.id === revisionId);
+    if (!revision || !revisionMatchesDocument(revision, document)) throw new Error("修订与知识源不匹配。");
+    return {
+      content: await versionWorkspace.readRevisionObject(revision),
+      sourcePath: revision.sourcePath,
+      sourceName: revision.sourcePath,
+      contentHash: revision.contentHash,
+      revision
+    };
+  }
+  const sourcePath = documentSourcePath(document);
+  return {
+    content: await fs.readFile(sourcePath),
+    sourcePath,
+    sourceName: document.originalName || document.fileName || path.basename(sourcePath),
+    contentHash: "",
+    revision: null
+  };
 }
 
 function snapshotSourceKey(document, sourcePath) {
@@ -734,7 +820,7 @@ function parseModelJson(content) {
   return JSON.parse(clean);
 }
 
-async function callModelJson(prompt, overrides = {}) {
+async function callModelContentJson(userContent, overrides = {}) {
   const config = modelConfiguration(overrides);
   if (!config.apiKey) return null;
   const controller = new AbortController();
@@ -744,7 +830,7 @@ async function callModelJson(prompt, overrides = {}) {
     temperature: 0.1,
     messages: [
       { role: "system", content: "你是严谨的游戏策划审阅助手。只输出可解析的 JSON。" },
-      { role: "user", content: prompt }
+      { role: "user", content: userContent }
     ]
   };
 
@@ -778,6 +864,44 @@ async function callModelJson(prompt, overrides = {}) {
     clearTimeout(timeout);
   }
 }
+
+async function callModelJson(prompt, overrides = {}) {
+  return callModelContentJson(prompt, overrides);
+}
+
+async function analyzeImageWithModel({ buffer, mediaType, sourceName }) {
+  const visionModel = String(process.env.OPENAI_VISION_MODEL || "").trim();
+  if (!visionModel) return null;
+  const prompt = [
+    "提取这张游戏策划相关图片中可用于知识检索的事实。",
+    "只记录图片中实际可见的文字、数值、界面状态、流程关系和标注，不推测未展示的信息。",
+    "区域坐标使用 0 到 1 的归一化 x、y、width、height。",
+    "返回 JSON：",
+    '{"summary":"图片整体内容","regions":[{"label":"区域名称","text":"区域中的事实","x":0,"y":0,"width":1,"height":1}]}',
+    "文件名：" + sourceName
+  ].join("\n");
+  return callModelContentJson([
+    { type: "text", text: prompt },
+    {
+      type: "image_url",
+      image_url: {
+        url: "data:" + mediaType + ";base64," + buffer.toString("base64"),
+        detail: "high"
+      }
+    }
+  ], { OPENAI_MODEL: visionModel });
+}
+
+const documentExtraction = new DocumentExtractionService({
+  indexRoot: extractedIndexDir,
+  imageAnalyzer: analyzeImageWithModel,
+  isImageAnalysisConfigured: () => Boolean(modelConfiguration().apiKey && String(process.env.OPENAI_VISION_MODEL || "").trim()),
+  imageAnalysisKey: () => {
+    const config = modelConfiguration();
+    return config.baseUrl + "|" + String(process.env.OPENAI_VISION_MODEL || "").trim();
+  },
+  clock: now
+});
 
 function normalizeExtractedPoints(rawPoints, rawText, store) {
   const points = Array.isArray(rawPoints) ? rawPoints.slice(0, 40) : [];
@@ -908,6 +1032,15 @@ function evidenceFromChunk(chunk, entry = {}) {
     heading: chunk.heading,
     lineStart: chunk.lineStart,
     lineEnd: chunk.lineEnd,
+    mediaType: chunk.mediaType || "",
+    contentHash: chunk.contentHash || "",
+    segmentId: chunk.segmentId || "",
+    pageNumber: chunk.pageNumber || null,
+    sheetName: chunk.sheetName || "",
+    cellRange: chunk.cellRange || "",
+    region: chunk.region || null,
+    revisionId: chunk.revisionId || "",
+    authority: chunk.authority || "workspace",
     knowledgeStatus: chunk.knowledgeStatus,
     excerpt: chunk.content.slice(0, 680),
     reason: String(entry.reason || "").trim(),
@@ -926,7 +1059,7 @@ function hydrateLegacyEvidence(items, chunks) {
 
   for (const item of items) {
     item.matchedKnowledge = (item.matchedKnowledge || []).map((source) => {
-      if (source.documentId && source.lineStart) return source;
+      if (source.documentId && (source.lineStart || source.segmentId || source.pageNumber || source.sheetName)) return source;
       const sourceBaseName = path.basename(String(source.source || source.sourcePath || ""));
       const candidates = chunks
         .filter((chunk) => {
@@ -1932,6 +2065,7 @@ app.get("/api/settings", async (_req, res) => {
     OPENAI_API_KEY: maskSecret(env.OPENAI_API_KEY || process.env.OPENAI_API_KEY),
     OPENAI_BASE_URL: env.OPENAI_BASE_URL || process.env.OPENAI_BASE_URL || "",
     OPENAI_MODEL: env.OPENAI_MODEL || process.env.OPENAI_MODEL || "",
+    OPENAI_VISION_MODEL: env.OPENAI_VISION_MODEL || process.env.OPENAI_VISION_MODEL || "",
     PORT: env.PORT || process.env.PORT || "8787",
     configured: Boolean(env.OPENAI_API_KEY || process.env.OPENAI_API_KEY)
   });
@@ -1992,20 +2126,34 @@ app.post("/api/knowledge/rescan", async (_req, res) => {
 
 app.post("/api/knowledge", upload.array("files", 30), async (req, res) => {
   const store = await readStore();
-  const created = (req.files || []).map((file) => ({
-    id: makeId("doc"),
-    sourceType: "upload",
-    fileName: file.filename,
-    originalName: file.originalname,
-    title: file.originalname.replace(/\.[^.]+$/, ""),
-    tags: [],
-    knowledgeStatus: inferKnowledgeStatus({ fileName: file.originalname }),
-    knowledgeStatusManual: false,
-    versionLabel: "",
-    size: file.size,
-    uploadedAt: now(),
-    updatedAt: now()
-  }));
+  const created = [];
+  for (const file of req.files || []) {
+    const originalName = Buffer.from(file.originalname, "latin1").toString("utf8");
+    const extension = path.extname(originalName).toLowerCase();
+    if (!supportedKnowledgeTypes.includes(extension)) {
+      await fs.rm(file.path, { force: true });
+      continue;
+    }
+    const extraction = attachmentTypes.includes(extension)
+      ? documentExtraction.summary(await documentExtraction.extractFile({ sourcePath: file.path, sourceName: originalName }))
+      : null;
+    created.push({
+      id: makeId("doc"),
+      sourceType: "upload",
+      fileName: file.filename,
+      originalName,
+      title: originalName.replace(/\.[^.]+$/, ""),
+      tags: [],
+      knowledgeStatus: inferKnowledgeStatus({ fileName: originalName }),
+      knowledgeStatusManual: false,
+      versionLabel: "",
+      mediaType: mediaTypeForName(originalName),
+      extraction,
+      size: file.size,
+      uploadedAt: now(),
+      updatedAt: now()
+    });
+  }
   store.documents.unshift(...created);
   await writeStore(store);
   res.json({ ok: true, documents: created });
@@ -2016,8 +2164,45 @@ app.get("/api/knowledge/:id/content", async (req, res) => {
     const store = await readStore();
     const document = store.documents.find((entry) => entry.id === req.params.id);
     if (!document) return res.status(404).json({ error: "知识源不存在。" });
-    const sourcePath = document.sourceType === "folder" ? document.filePath : path.join(uploadDir, document.fileName);
-    const raw = await fs.readFile(sourcePath, "utf8");
+    const revisionId = String(req.query.revisionId || "");
+    const source = await readDocumentBinary(store, document, revisionId);
+    const extension = path.extname(source.sourceName).toLowerCase();
+    if (!knowledgeTypes.includes(extension)) {
+      const index = await documentExtraction.extractBuffer({
+        content: source.content,
+        sourceName: source.sourceName,
+        contentHash: source.contentHash
+      });
+      const requestedSegmentId = String(req.query.segmentId || "");
+      const requestedPage = Number(req.query.page || 0);
+      const requestedSheet = String(req.query.sheet || "");
+      let selectedIndex = requestedSegmentId
+        ? index.segments.findIndex((entry) => entry.id === requestedSegmentId)
+        : -1;
+      if (selectedIndex < 0 && requestedPage) {
+        selectedIndex = index.segments.findIndex((entry) => entry.pageNumber === requestedPage);
+      }
+      if (selectedIndex < 0 && requestedSheet) {
+        selectedIndex = index.segments.findIndex((entry) => entry.sheetName === requestedSheet);
+      }
+      const startIndex = selectedIndex < 0 ? 0 : Math.max(0, selectedIndex - 2);
+      const visibleSegments = index.segments.slice(startIndex, selectedIndex < 0 ? 8 : selectedIndex + 3);
+      const originalQuery = revisionId ? "?revisionId=" + encodeURIComponent(revisionId) : "";
+      return res.json({
+        mode: "attachment",
+        documentId: document.id,
+        source: source.sourceName,
+        filePath: source.sourcePath,
+        revisionId,
+        mediaType: index.mediaType,
+        extractionStatus: index.status,
+        extractionError: index.error || "",
+        originalUrl: "/api/knowledge/" + document.id + "/original" + originalQuery,
+        selectedSegmentId: selectedIndex >= 0 ? index.segments[selectedIndex].id : "",
+        segments: visibleSegments
+      });
+    }
+    const raw = source.content.toString("utf8");
     const lines = raw.split(/\r?\n/);
     const start = clampNumber(req.query.start, 1, Math.max(lines.length, 1));
     const end = clampNumber(req.query.end || start + 12, start, Math.max(lines.length, start));
@@ -2025,8 +2210,10 @@ app.get("/api/knowledge/:id/content", async (req, res) => {
     const contextEnd = Math.min(lines.length, end + 4);
     res.json({
       documentId: document.id,
-      source: document.originalName,
-      filePath: sourcePath,
+      source: source.sourceName,
+      filePath: source.sourcePath,
+      revisionId,
+      mode: "text",
       start,
       end,
       lines: lines.slice(contextStart - 1, contextEnd).map((content, index) => ({
@@ -2034,6 +2221,23 @@ app.get("/api/knowledge/:id/content", async (req, res) => {
         content
       }))
     });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.get("/api/knowledge/:id/original", async (req, res) => {
+  try {
+    const store = await readStore();
+    const document = store.documents.find((entry) => entry.id === req.params.id);
+    if (!document) return res.status(404).json({ error: "知识源不存在。" });
+    const source = await readDocumentBinary(store, document, String(req.query.revisionId || ""));
+    const fileName = path.basename(source.sourceName || document.originalName || "attachment");
+    res.type(mediaTypeForName(fileName));
+    res.setHeader("Content-Disposition", "inline; filename*=UTF-8''" + encodeURIComponent(fileName));
+    res.setHeader("Cache-Control", "private, no-store");
+    res.setHeader("X-Content-Authority", source.revision ? "archived-revision" : "workspace");
+    res.send(source.content);
   } catch (error) {
     res.status(400).json({ error: error.message });
   }
@@ -2314,7 +2518,7 @@ app.get("/api/versioning/revisions/:id/content", async (req, res) => {
   try {
     const result = await versionWorkspace.readRevision(req.params.id);
     const extension = path.extname(result.revision.sourcePath || "").toLowerCase();
-    res.type(knowledgeTypes.includes(extension) ? "text/plain; charset=utf-8" : "application/octet-stream");
+    res.type(knowledgeTypes.includes(extension) ? "text/plain; charset=utf-8" : mediaTypeForName(result.revision.sourcePath));
     res.setHeader("X-Revision-Id", result.revision.id);
     res.send(result.content);
   } catch (error) {
@@ -2777,6 +2981,7 @@ app.post("/api/export", async (req, res) => {
   res.json({ fileName, markdown });
 });
 
+await documentExtraction.initialize();
 await ensureStoreMigrated();
 await versionWorkspace.initialize();
 
